@@ -383,9 +383,7 @@ class AntForest : ModelTask(), EnergyCollectCallback {
     }
 
     internal fun hasFriendRankingWorkEnabled(): Boolean {
-        return isCollectEnergyEnabled() ||
-                collectGiftBox?.value == true ||
-                hasRebornProtectWorkEnabled()
+        return isCollectEnergyEnabled()
     }
 
     override fun getFields(): ModelFields {
@@ -2836,7 +2834,7 @@ class AntForest : ModelTask(), EnergyCollectCallback {
      */
     internal suspend fun collectFriendEnergyCoroutine() {
         if (!hasFriendRankingWorkEnabled()) {
-            Log.forest("收集能量、领取礼盒和复活能量均未开启，跳过好友排行榜扫描")
+            Log.forest("收能量未开启，跳过好友主页扫描；好友礼盒/复活能量仅随已获取好友主页处理")
             return
         }
         resetRebornScanStateForFriendRanking()
@@ -3009,31 +3007,16 @@ class AntForest : ModelTask(), EnergyCollectCallback {
             collectEnergy(userId, queryFriendHome(userId, "PKContest"), "pk")
         } else { // 普通好友
             val needCollectEnergy = collectEnergy?.value == true && !jsonCollectMap.contains(userId)
-            val needHelpProtect = canTryRebornProtectNow(userId) && !handledProtectUsers.contains(userId)
-            val needCollectGiftBox = collectGiftBox?.value == true &&
-                    !handledGiftBoxUsers.contains(userId) &&
-                    obj.optBoolean("canCollectGiftBox")
             val energyAlreadyProcessed = processedUsersCache.contains(userId)
             val shouldQueryForEnergy = needCollectEnergy && !energyAlreadyProcessed
-            if (!shouldQueryForEnergy && !needHelpProtect && !needCollectGiftBox) {
+            if (!shouldQueryForEnergy) {
                 //   Log.forest("    普通好友: [$userName$userId], 所有条件不满足，跳过")
                 return
             }
-            var userHomeObj: JSONObject? = null
             // 只要开启了收能量，就进去看看，以便添加蹲点
-            if (shouldQueryForEnergy) {
-                // 即使排行榜信息显示没有可收能量，也进去检查，以便添加蹲点任务
-                Log.forest("  正在查询好友 [$userName$userId] 的主页...")
-                userHomeObj = collectEnergy(userId, queryFriendHome(userId, null), "friend")
-            }
-            if (needHelpProtect || needCollectGiftBox) {
-                val shouldRefreshExtraBenefitHome = userHomeObj == null ||
-                    (needHelpProtect && !shouldProtectFriendEnergyFromHome(userId, userHomeObj)) ||
-                    (needCollectGiftBox && !shouldCollectGiftBoxFromHome(userHomeObj))
-                if (shouldRefreshExtraBenefitHome) {
-                    userHomeObj = queryFriendHome(userId, "rankNew", forceRefresh = userHomeObj != null)
-                }
-            }
+            // 即使排行榜信息显示没有可收能量，也进去检查，以便添加蹲点任务
+            Log.forest("  正在查询好友 [$userName$userId] 的主页...")
+            val userHomeObj = collectEnergy(userId, queryFriendHome(userId, null), "friend")
             handleFriendExtraBenefits(userId, userHomeObj)
         }
     }
@@ -7678,13 +7661,18 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         return 0L // 立即收取，无延迟
     }
 
+    override fun canRunWaitingCollection(): Boolean {
+        return isCollectEnergyEnabled()
+    }
+
     override suspend fun collectUserEnergyForWaiting(task: EnergyWaitingManager.WaitingTask): CollectResult {
         if (!isCollectEnergyEnabled()) {
-            Log.forest("收集能量开关关闭，跳过蹲点收取")
+            Log.forest("收集能量开关关闭，暂停蹲点收取")
             return CollectResult(
                 success = false,
                 userName = task.userName,
-                message = "收集能量开关关闭"
+                message = EnergyWaitingManager.WAITING_PAUSED_COLLECT_DISABLED,
+                paused = true
             )
         }
         return try {
