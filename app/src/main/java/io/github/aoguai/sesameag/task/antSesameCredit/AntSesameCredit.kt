@@ -31,6 +31,8 @@ import io.github.aoguai.sesameag.task.exchange.ExchangeCost
 import io.github.aoguai.sesameag.task.exchange.ExchangeEffectCatalog
 import io.github.aoguai.sesameag.task.exchange.ExchangeItem
 import io.github.aoguai.sesameag.task.exchange.ExchangeLimit
+import io.github.aoguai.sesameag.task.exchange.ExchangeOptionRow
+import io.github.aoguai.sesameag.task.exchange.ExchangeOptionsCache
 import io.github.aoguai.sesameag.task.exchange.ExchangeSafety
 import io.github.aoguai.sesameag.task.exchange.ExchangeSafetyRules
 import io.github.aoguai.sesameag.util.CoroutineUtils
@@ -3292,19 +3294,37 @@ class AntSesameCredit : ModelTask() {
      */
     private fun refreshSesameGrainExchangeOptionsForSettings(): List<MapperEntity> {
         if (!HookReadyChecker.isCurrentProcessReadyForRpc(UserMap.currentUid)) {
-            if (!HookReadyChecker.isTargetAppReadyForRpc(UserMap.currentUid) ||
-                !ExchangeOptionsRefreshBridge.requestRefresh(
-                    ExchangeOptionsRefreshBridge.TARGET_SESAME_GRAIN,
-                    UserMap.currentUid
+            if (!HookReadyChecker.isTargetAppReadyForRpc(UserMap.currentUid)) {
+                val cachedRows = ExchangeOptionsCache.loadForSettingsCache(
+                    UserMap.currentUid,
+                    ExchangeOptionsRefreshBridge.TARGET_SESAME_GRAIN
                 )
-            ) {
-                Log.sesame("芝麻粒兑换🛒目标应用未启动，设置页使用缓存列表")
-                return SesameGift.getList()
+                Log.sesame("芝麻粒兑换🛒目标应用未启动，设置页使用结构化缓存列表#${cachedRows.size}")
+                return cachedRows
             }
-            Log.sesame("芝麻粒兑换🛒目标应用已远程刷新列表")
-            IdMapManager.getInstance(SesameGiftMap::class.java).load(UserMap.currentUid)
-            return SesameGift.getList()
+            val refreshResult = ExchangeOptionsRefreshBridge.requestRefreshOptions(
+                ExchangeOptionsRefreshBridge.TARGET_SESAME_GRAIN,
+                UserMap.currentUid
+            )
+            if (refreshResult.success) {
+                Log.sesame("芝麻粒兑换🛒设置页使用目标应用刷新列表#${refreshResult.options.size}")
+                return refreshResult.options
+            }
+            Log.sesame("芝麻粒兑换🛒远程刷新失败，不使用旧缓存#${refreshResult.message}")
+            return emptyList()
         }
+        val rows = runCatching {
+            refreshSesameGrainExchangeOptionsFromRpc()
+        }.onFailure {
+            Log.printStackTrace(TAG, "refreshSesameGrainExchangeOptionsForSettings.currentRpc err:", it)
+        }.getOrElse {
+            emptyList()
+        }
+        Log.sesame("芝麻粒兑换🛒设置页刷新结构化列表#${rows.size}")
+        return rows
+    }
+
+    private fun refreshSesameGrainExchangeOptionsFromRpc(): List<ExchangeOptionRow> {
         try {
             val userId = UserMap.currentUid
             val maxPage = 10
@@ -3313,7 +3333,7 @@ class AntSesameCredit : ModelTask() {
             val scannedTabs = LinkedHashSet<String>()
             val seenTemplateIds = LinkedHashSet<String>()
             val sesameGiftMap = IdMapManager.getInstance(SesameGiftMap::class.java)
-            val mapperList = mutableListOf<MapperEntity>()
+            val rows = mutableListOf<ExchangeOptionRow>()
             var tabIndex = 0
             var refreshedCount = 0
             while (tabIndex < pendingTabs.size) {
@@ -3351,7 +3371,7 @@ class AntSesameCredit : ModelTask() {
                             continue
                         }
                         sesameGiftMap.add(candidate.item.id, candidate.item.displayName())
-                        mapperList.add(candidate.item.toMapperEntity())
+                        rows.add(candidate.item.toOptionRow())
                         refreshedCount++
                     }
                     hasNextPage = data.optBoolean("hasNext", false)
@@ -3359,17 +3379,17 @@ class AntSesameCredit : ModelTask() {
                 }
             }
             sesameGiftMap.save(userId)
-            Log.sesame("芝麻粒兑换🛒设置页刷新列表#$refreshedCount")
-            return mapperList.ifEmpty { SesameGift.getList() }
+            ExchangeOptionsCache.save(userId, ExchangeOptionsRefreshBridge.TARGET_SESAME_GRAIN, rows)
+            Log.sesame("芝麻粒兑换🛒刷新列表#$refreshedCount")
+            return rows
         } catch (t: Throwable) {
-            Log.printStackTrace(TAG, "refreshSesameGrainExchangeOptionsForSettings err:", t)
-            return SesameGift.getList()
+            Log.printStackTrace(TAG, "refreshSesameGrainExchangeOptionsFromRpc err:", t)
+            throw t
         }
     }
 
-    internal fun refreshSesameGrainExchangeOptionsForRemote() {
-        refreshSesameGrainExchangeOptionsForSettings()
-    }
+    internal fun refreshSesameGrainExchangeOptionsForRemote(): List<ExchangeOptionRow> =
+        refreshSesameGrainExchangeOptionsFromRpc()
 
     internal suspend fun doSesameGrainExchange(): Unit = CoroutineUtils.run {
         // 每日只运行一次，避免重复请求

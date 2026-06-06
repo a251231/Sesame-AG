@@ -56,6 +56,8 @@ import io.github.aoguai.sesameag.task.exchange.ExchangeEffectCatalog
 import io.github.aoguai.sesameag.task.exchange.ExchangeEffectNeed
 import io.github.aoguai.sesameag.task.exchange.ExchangeItem
 import io.github.aoguai.sesameag.task.exchange.ExchangeLimit
+import io.github.aoguai.sesameag.task.exchange.ExchangeOptionRow
+import io.github.aoguai.sesameag.task.exchange.ExchangeOptionsCache
 import io.github.aoguai.sesameag.task.exchange.ExchangeReplenishResult
 import io.github.aoguai.sesameag.task.exchange.ExchangeReplenisher
 import io.github.aoguai.sesameag.task.exchange.ExchangeSafety
@@ -711,7 +713,7 @@ class AntForest : ModelTask(), EnergyCollectCallback {
             SelectAndCountModelField(
                 "vitalityExchangeList", "活力值 | 兑换列表", LinkedHashMap<String?, Int?>(),
                 this::refreshVitalityExchangeOptionsForSettings,
-                "记得填兑换次数..亲爱的"
+                "记得填兑换次数"
             ).withDesc("配置活力值商店兑换项及每日兑换次数。").also { vitalityExchangeList = it })
         modelFields.addField(BooleanModelField("userPatrol", "保护地巡护 | 开启", false).withDesc(
             "执行保护地巡护，消耗步数机会获取动物碎片。"
@@ -1780,36 +1782,49 @@ class AntForest : ModelTask(), EnergyCollectCallback {
 
     private fun refreshVitalityExchangeOptionsForSettings(): List<MapperEntity> {
         if (!HookReadyChecker.isCurrentProcessReadyForRpc(UserMap.currentUid)) {
-            if (!HookReadyChecker.isTargetAppReadyForRpc(UserMap.currentUid) ||
-                !ExchangeOptionsRefreshBridge.requestRefresh(
-                    ExchangeOptionsRefreshBridge.TARGET_FOREST_VITALITY,
-                    UserMap.currentUid
+            if (!HookReadyChecker.isTargetAppReadyForRpc(UserMap.currentUid)) {
+                val cachedRows = ExchangeOptionsCache.loadForSettingsCache(
+                    UserMap.currentUid,
+                    ExchangeOptionsRefreshBridge.TARGET_FOREST_VITALITY
                 )
-            ) {
-                Log.forest("活力值兑换🎁目标应用未启动，设置页使用缓存列表")
-                return VitalityStore.list
+                Log.forest("活力值兑换🎁目标应用未启动，设置页使用结构化缓存列表#${cachedRows.size}")
+                return cachedRows
             }
-            Log.forest("活力值兑换🎁目标应用已远程刷新列表")
-            IdMapManager.getInstance(VitalityRewardsMap::class.java).load(UserMap.currentUid)
-            return VitalityStore.list
+            val refreshResult = ExchangeOptionsRefreshBridge.requestRefreshOptions(
+                ExchangeOptionsRefreshBridge.TARGET_FOREST_VITALITY,
+                UserMap.currentUid
+            )
+            if (refreshResult.success) {
+                Log.forest("活力值兑换🎁设置页使用目标应用刷新列表#${refreshResult.options.size}")
+                return refreshResult.options
+            }
+            Log.forest("活力值兑换🎁远程刷新失败，不使用旧缓存#${refreshResult.message}")
+            return emptyList()
         }
+        val rows = refreshVitalityExchangeOptionsFromRpc()
+        Log.forest("活力值兑换🎁设置页刷新结构化列表#${rows.size}")
+        return rows
+    }
+
+    internal fun refreshVitalityExchangeOptionsForRemote(): List<ExchangeOptionRow> =
+        refreshVitalityExchangeOptionsFromRpc()
+
+    private fun refreshVitalityExchangeOptionsFromRpc(): List<ExchangeOptionRow> {
         return runCatching {
             Vitality.initVitality("SC_ASSETS")
-            buildVitalityExchangeMapperList().ifEmpty { VitalityStore.list }
+            val rows = buildVitalityExchangeOptionRows()
+            ExchangeOptionsCache.save(UserMap.currentUid, ExchangeOptionsRefreshBridge.TARGET_FOREST_VITALITY, rows)
+            rows
         }.onFailure {
-            Log.printStackTrace(TAG, "refreshVitalityExchangeOptionsForSettings err:", it)
+            Log.printStackTrace(TAG, "refreshVitalityExchangeOptionsFromRpc err:", it)
         }.getOrElse {
-            VitalityStore.list
+            emptyList()
         }
     }
 
-    internal fun refreshVitalityExchangeOptionsForRemote() {
-        Vitality.initVitality("SC_ASSETS")
-    }
-
-    private fun buildVitalityExchangeMapperList(): List<MapperEntity> {
+    private fun buildVitalityExchangeOptionRows(): List<ExchangeOptionRow> {
         return Vitality.skuInfo.entries
-            .mapNotNull { (skuId, skuModel) -> buildVitalityExchangeItem(skuId, skuModel).toMapperEntity() }
+            .mapNotNull { (skuId, skuModel) -> buildVitalityExchangeItem(skuId, skuModel).toOptionRow() }
     }
 
     private fun buildVitalityExchangeItem(skuId: String, skuModel: JSONObject): ExchangeItem {
