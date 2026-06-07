@@ -91,7 +91,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Runnable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Semaphore
@@ -1012,31 +1011,14 @@ class AntForest : ModelTask(), EnergyCollectCallback {
             }
 
             if (energyOnlyModeAtStart) {
-                var energyRound = 0
-                while (currentCoroutineContext().isActive) {
-                    TaskCommon.update()
-                    if (!TaskCommon.IS_ENERGY_TIME) {
-                        Log.forest("当前不在只收能量时间段，退出只收能量循环")
-                        break
-                    }
-                    energyRound++
-                    Log.forest("⏸ 当前为只收能量时间【${BaseModel.energyTime.value}】，开始第${energyRound}轮只收能量链路")
+                TaskCommon.update()
+                if (TaskCommon.IS_ENERGY_TIME) {
+                    Log.forest("⏸ 当前为只收能量时间【${BaseModel.energyTime.value}】，执行本次只收能量链路")
                     runEnergyOnlyCollectionWorkflow(tc)
                     clearRoundCaches()
-
-                    TaskCommon.update()
-                    if (!TaskCommon.IS_ENERGY_TIME) {
-                        Log.forest("只收能量时间已结束，本轮只收能量链路完成后退出循环")
-                        break
-                    }
-
-                    val sleepMillis = (cycleinterval?.value ?: cycleinterval?.defaultValue ?: 0).toLong()
-                    if (sleepMillis > 0) {
-                        Log.forest("✨ 只收能量时间第${energyRound}轮完成，等待 $sleepMillis 毫秒后开始下一轮")
-                        delay(sleepMillis)
-                    } else {
-                        Log.forest("✨ 只收能量时间第${energyRound}轮完成，循环间隔为0，立即开始下一轮")
-                    }
+                    Log.forest("✨ 本次只收能量链路完成，交回统一调度")
+                } else {
+                    Log.forest("当前不在只收能量时间段，跳过只收能量链路并交回统一调度")
                 }
                 tc.stop()
                 return
@@ -2522,11 +2504,13 @@ class AntForest : ModelTask(), EnergyCollectCallback {
                 val subList: MutableList<Long> =
                     bubbleIds.subList(i, min(i + MAX_BATCH_SIZE, bubbleIds.size))
                 val collectEnergyEntity = CollectEnergyEntity(
-                    safeUserId,
-                    userHomeObj,
-                    AntForestRpcCall.batchEnergyRpcEntity(bizType, safeUserId, subList, rpcSource),
-                    fromTag,
-                    skipPropCheck  // 🚀 传递快速通道标记
+                    userId = safeUserId,
+                    userHome = userHomeObj,
+                    rpcEntity = AntForestRpcCall.batchEnergyRpcEntity(bizType, safeUserId, subList, rpcSource),
+                    fromTag = fromTag,
+                    skipPropCheck = skipPropCheck,  // 🚀 传递快速通道标记
+                    bizType = bizType,
+                    rpcSource = rpcSource
                 )
                 collectEnergy(collectEnergyEntity)
                 failedBubbleIds.addAll(collectEnergyEntity.failedBubbleIds)
@@ -2535,11 +2519,13 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         } else {
             for (id in bubbleIds) {
                 val collectEnergyEntity = CollectEnergyEntity(
-                    safeUserId,
-                    userHomeObj,
-                    AntForestRpcCall.energyRpcEntity(bizType, safeUserId, id, rpcSource),
-                    fromTag,
-                    skipPropCheck  // 🚀 传递快速通道标记
+                    userId = safeUserId,
+                    userHome = userHomeObj,
+                    rpcEntity = AntForestRpcCall.energyRpcEntity(bizType, safeUserId, id, rpcSource),
+                    fromTag = fromTag,
+                    skipPropCheck = skipPropCheck,  // 🚀 传递快速通道标记
+                    bizType = bizType,
+                    rpcSource = rpcSource
                 )
                 collectEnergy(collectEnergyEntity)
                 failedBubbleIds.addAll(collectEnergyEntity.failedBubbleIds)
@@ -2777,7 +2763,7 @@ class AntForest : ModelTask(), EnergyCollectCallback {
         var consecutiveEmpty = 0
         var shouldCooldown = false
         var firstTakeLook = true
-        var firstTakeLookExposedUserId = selfId.orEmpty()
+        var firstTakeLookExposedUserId = ""
 
         // 本地去重集合：防止单次运行中服务器重复返回同一个有保护罩的人
         val visitedInSession = mutableSetOf<String>()
@@ -2792,6 +2778,22 @@ class AntForest : ModelTask(), EnergyCollectCallback {
             }
         }
 
+        fun extractTakeLookExposeFriendId(combineBizObj: JSONObject): String? {
+            val rootFriendId = combineBizObj
+                .optJSONObject("combineHandlerVOMap")
+                ?.optJSONObject("takeLookExpose")
+                ?.optString("friendUserId")
+                ?.takeIf { it.isNotBlank() }
+            if (!rootFriendId.isNullOrBlank()) return rootFriendId
+
+            return combineBizObj
+                .optJSONObject("resData")
+                ?.optJSONObject("combineHandlerVOMap")
+                ?.optJSONObject("takeLookExpose")
+                ?.optString("friendUserId")
+                ?.takeIf { it.isNotBlank() }
+        }
+
         try {
             try {
                 val combineBizResult = AntForestRpcCall.queryTakeLookCombineBiz(
@@ -2802,11 +2804,7 @@ class AntForest : ModelTask(), EnergyCollectCallback {
                 )
                 if (combineBizResult.isNotBlank()) {
                     val combineBizObj = JSONObject(combineBizResult)
-                    val exposedFriendId = combineBizObj
-                        .optJSONObject("combineHandlerVOMap")
-                        ?.optJSONObject("takeLookExpose")
-                        ?.optString("friendUserId")
-                        ?.takeIf { it.isNotBlank() }
+                    val exposedFriendId = extractTakeLookExposeFriendId(combineBizObj)
                     if (!exposedFriendId.isNullOrBlank()) {
                         firstTakeLookExposedUserId = exposedFriendId
                         Log.forest("找能量预曝光目标已更新")
@@ -3518,9 +3516,10 @@ class AntForest : ModelTask(), EnergyCollectCallback {
                     }
                     if (!newBubbleIdList.isEmpty()) {
                         collectEnergyEntity.rpcEntity = AntForestRpcCall.batchEnergyRpcEntity(
-                            "",
+                            collectEnergyEntity.bizType,
                             userId,
-                            newBubbleIdList
+                            newBubbleIdList,
+                            collectEnergyEntity.rpcSource
                         )
                         collectEnergyEntity.setNeedDouble()
                         collectEnergyEntity.resetTryCount()
