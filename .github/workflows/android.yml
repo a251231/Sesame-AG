@@ -138,11 +138,11 @@ jobs:
           git fetch origin "refs/heads/${TARGET_SOURCE_BRANCH}:refs/remotes/origin/${TARGET_SOURCE_BRANCH}" --force
 
           missing=()
-          [[ -n "${ANDROID_SIGNING_KEY}" ]] || missing+=("ANDROID_SIGNING_KEY")
-          [[ -n "${ANDROID_KEY_ALIAS}" ]] || missing+=("ANDROID_KEY_ALIAS")
-          [[ -n "${ANDROID_KEYSTORE_PASSWORD}" ]] || missing+=("ANDROID_KEYSTORE_PASSWORD")
-          [[ -n "${ANDROID_KEY_PASSWORD}" ]] || missing+=("ANDROID_KEY_PASSWORD")
           if [[ "${PUBLISH_TO_XPOSED_REPO}" == "true" ]]; then
+            [[ -n "${ANDROID_SIGNING_KEY}" ]] || missing+=("ANDROID_SIGNING_KEY")
+            [[ -n "${ANDROID_KEY_ALIAS}" ]] || missing+=("ANDROID_KEY_ALIAS")
+            [[ -n "${ANDROID_KEYSTORE_PASSWORD}" ]] || missing+=("ANDROID_KEYSTORE_PASSWORD")
+            [[ -n "${ANDROID_KEY_PASSWORD}" ]] || missing+=("ANDROID_KEY_PASSWORD")
             [[ -n "${TARGET_REPO_PAT}" ]] || missing+=("TARGET_REPO_PAT")
           fi
 
@@ -161,7 +161,7 @@ jobs:
             reason="标签 ${RELEASE_TAG_RAW} 指向的提交不在 ${TARGET_SOURCE_BRANCH} 分支上"
           elif [[ "${PUBLISH_TO_XPOSED_REPO}" != "true" ]]; then
             ready="true"
-            reason="预检通过"
+            reason="预检通过，将打包本仓库构建产物"
           else
             api_url="https://api.github.com/repos/${TARGET_MODULE_REPO}"
             if http_code="$(curl -sS -o target_repo.json -w "%{http_code}" \
@@ -221,6 +221,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      HAS_ANDROID_SIGNING_SECRETS: ${{ secrets.ANDROID_SIGNING_KEY != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
 
     steps:
       - name: Set Timezone to Asia/Shanghai
@@ -313,6 +315,7 @@ jobs:
           done
 
       - name: Sign APKs
+        if: env.HAS_ANDROID_SIGNING_SECRETS == 'true'
         id: sign_apks
         uses: ilharp/sign-android-release@v2
         with:
@@ -536,7 +539,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${ASSET_DIR}"
-          IFS=':' read -r -a files <<< "${{ steps.sign_apks.outputs.signedFiles }}"
+          signed_files="${{ steps.sign_apks.outputs.signedFiles }}"
+          if [[ -n "${signed_files}" ]]; then
+            IFS=':' read -r -a files <<< "${signed_files}"
+          else
+            mapfile -t files < <(find "${STAGING_DIR}" -maxdepth 1 -type f -name "*.apk" | sort)
+          fi
           copied=0
           for file in "${files[@]}"; do
             [[ -n "${file}" ]] || continue
@@ -548,7 +556,7 @@ jobs:
             copied=$((copied + 1))
           done
           if [[ ${copied} -eq 0 ]]; then
-            echo "No signed APKs were produced" >&2
+            echo "No APKs were prepared for release assets" >&2
             exit 1
           fi
           if [[ "${PUBLISH_TO_XPOSED_REPO}" != "true" ]]; then
