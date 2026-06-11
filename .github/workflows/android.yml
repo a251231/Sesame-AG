@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to build, format: VersionCode-VersionName (for example, 123-0.9.9)"
+        description: "Release tag to use, format: VersionCode-VersionName (versionCode is git rev-list --count HEAD)"
         required: true
         type: string
 
@@ -28,7 +28,7 @@ env:
   ASSET_DIR: app/build/outputs/apk/release-assets
   ARTIFACT_PASSWORD: Sesame-AG
   RELEASE_TAG_RAW: ${{ inputs.release_tag || github.event.release.tag_name || github.ref_name }}
-  RELEASE_REF: refs/tags/${{ inputs.release_tag || github.event.release.tag_name || github.ref_name }}
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && github.ref || format('refs/tags/{0}', github.event.release.tag_name || github.ref_name) }}
   TARGET_SOURCE_BRANCH: main
   TARGET_MODULE_REPO: Xposed-Modules-Repo/io.github.aoguai.sesameag
   PUBLISH_TO_XPOSED_REPO: "false"
