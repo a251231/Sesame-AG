@@ -1,10 +1,18 @@
 name: Release Build
-run-name: Release Build - ${{ github.ref_name }}
+run-name: Release Build - ${{ inputs.release_tag || github.event.release.tag_name || github.ref_name }}
 
 on:
   push:
     tags:
       - "[0-9]*-*"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build, format: VersionCode-VersionName (for example, 123-0.9.9)"
+        required: true
+        type: string
 
 env:
   CI: "true"
@@ -19,13 +27,14 @@ env:
   STAGING_DIR: app/build/outputs/apk/all
   ASSET_DIR: app/build/outputs/apk/release-assets
   ARTIFACT_PASSWORD: Sesame-AG
-  RELEASE_TAG_RAW: ${{ github.ref_name }}
-  TARGET_SOURCE_BRANCH: dev
+  RELEASE_TAG_RAW: ${{ inputs.release_tag || github.event.release.tag_name || github.ref_name }}
+  RELEASE_REF: refs/tags/${{ inputs.release_tag || github.event.release.tag_name || github.ref_name }}
+  TARGET_SOURCE_BRANCH: main
   TARGET_MODULE_REPO: Xposed-Modules-Repo/io.github.aoguai.sesameag
   PUBLISH_TO_XPOSED_REPO: "false"
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ inputs.release_tag || github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -55,7 +64,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.ref }}
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Validate Project Toolchain Baseline
         shell: bash
@@ -65,7 +74,7 @@ jobs:
           grep -Eq '^distributionUrl=.*gradle-'"${LOCAL_GRADLE_VERSION//./\\.}"'-bin\.zip$' gradle/wrapper/gradle-wrapper.properties
           grep -Eq '^android-plugin = "'"${LOCAL_AGP_VERSION//./\\.}"'"$' gradle/libs.versions.toml
           grep -Eq '^kotlin = "'"${LOCAL_KOTLIN_VERSION//./\\.}"'"$' gradle/libs.versions.toml
-          grep -Eq '^appVersion=.+' gradle.properties
+          grep -Eq 'versionName = "[^"]+"' app/build.gradle.kts
           grep -Eq 'compileSdk = '"${ANDROID_API_LEVEL}"'$' app/build.gradle.kts
           grep -Eq 'sourceCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
           grep -Eq 'targetCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
@@ -87,9 +96,9 @@ jobs:
             version_name="${BASH_REMATCH[2]}"
           fi
 
-          configured_version_name="$(sed -n 's/^appVersion=//p' gradle.properties | head -n1 | tr -d '\r')"
+          configured_version_name="$(sed -n 's/^[[:space:]]*versionName = "\([^"]\+\)".*/\1/p' app/build.gradle.kts | head -n1 | tr -d '\r')"
           if [[ -z "${configured_version_name}" ]]; then
-            echo "Failed to resolve appVersion from gradle.properties" >&2
+            echo "Failed to resolve versionName from app/build.gradle.kts" >&2
             exit 1
           fi
 
@@ -145,10 +154,10 @@ jobs:
           elif [[ "${TAG_VALID}" != "true" ]]; then
             reason="标签 ${RELEASE_TAG_RAW} 不符合 Xposed 要求的 VersionCode-VersionName 格式"
           elif [[ "${VERSION_NAME}" != "${CONFIGURED_VERSION_NAME}" ]]; then
-            reason="标签中的 versionName (${VERSION_NAME}) 与 gradle.properties 中配置的 appVersion (${CONFIGURED_VERSION_NAME}) 不一致"
+            reason="标签中的 versionName (${VERSION_NAME}) 与 app/build.gradle.kts 中配置的 versionName (${CONFIGURED_VERSION_NAME}) 不一致"
           elif [[ "${TAG_VERSION_CODE}" != "${VERSION_CODE}" ]]; then
             reason="标签中的 versionCode (${TAG_VERSION_CODE}) 与当前提交计算得到的 versionCode (${VERSION_CODE}) 不一致"
-          elif ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${TARGET_SOURCE_BRANCH}"; then
+          elif ! git merge-base --is-ancestor HEAD "origin/${TARGET_SOURCE_BRANCH}"; then
             reason="标签 ${RELEASE_TAG_RAW} 指向的提交不在 ${TARGET_SOURCE_BRANCH} 分支上"
           elif [[ "${PUBLISH_TO_XPOSED_REPO}" != "true" ]]; then
             ready="true"
@@ -192,7 +201,7 @@ jobs:
           {
             echo "## Release Preflight"
             echo
-            echo "- 触发事件: \`push(tag)\`"
+            echo "- 触发事件: \`${GITHUB_EVENT_NAME}\`"
             echo "- 源仓库标签: \`${RELEASE_TAG_RAW}\`"
             echo "- 校验分支: \`${TARGET_SOURCE_BRANCH}\`"
             echo "- 标签格式有效: \`${TAG_VALID}\`"
@@ -225,7 +234,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.ref }}
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Set up JDK
         uses: actions/setup-java@v5
@@ -325,14 +334,16 @@ jobs:
           set -euo pipefail
 
           body_path="${RUNNER_TEMP}/xposed-release-body.md"
-          tag_object_type="$(git cat-file -t "${GITHUB_REF}" 2>/dev/null || true)"
+          current_sha="$(git rev-parse HEAD)"
+          tag_ref="refs/tags/${RELEASE_TAG_RAW}"
+          tag_object_type="$(git cat-file -t "${tag_ref}" 2>/dev/null || true)"
           repo_name="${REPOSITORY#*/}"
           tag_notes=""
-          prev_tag="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          prev_tag="$(git describe --tags --abbrev=0 "${current_sha}^" 2>/dev/null || true)"
           commit_history_url="https://github.com/${REPOSITORY}/commits/${RELEASE_TAG_RAW}"
           compare_url=""
           commit_range_display="首次发布（完整历史）"
-          range_args=("${GITHUB_SHA}")
+          range_args=("${current_sha}")
           excluded_type_regex='^(docs|style|ci|test|build)(\([^)]*\))?[!]?:[[:space:]]+'
           commit_type_regex='^([[:alpha:]]+)(\([^)]*\))?[!]?:[[:space:]]+'
           tmp_dir="$(mktemp -d)"
@@ -353,13 +364,13 @@ jobs:
           done
 
           if [[ "${tag_object_type}" == "tag" ]]; then
-            tag_notes="$(git for-each-ref "${GITHUB_REF}" --format='%(contents)')"
+            tag_notes="$(git for-each-ref "${tag_ref}" --format='%(contents)')"
           fi
 
           if [[ -n "${prev_tag}" ]]; then
             compare_url="https://github.com/${REPOSITORY}/compare/${prev_tag}...${RELEASE_TAG_RAW}"
             commit_range_display="${prev_tag}...${RELEASE_TAG_RAW}"
-            range_args=("${prev_tag}..${GITHUB_SHA}")
+            range_args=("${prev_tag}..${current_sha}")
           fi
 
           contributors_path="${tmp_dir}/contributors.tsv"
@@ -562,7 +573,7 @@ jobs:
         if: env.PUBLISH_TO_XPOSED_REPO != 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: Sesame-AG-${{ github.ref_name }}
+          name: Sesame-AG-${{ env.RELEASE_TAG_RAW }}
           archive: false
           path: ${{ steps.package_artifact.outputs.artifact_path }}
           if-no-files-found: error
