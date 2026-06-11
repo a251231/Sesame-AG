@@ -26,7 +26,6 @@ env:
   RELEASE_DIR: app/build/outputs/apk/release
   STAGING_DIR: app/build/outputs/apk/all
   ASSET_DIR: app/build/outputs/apk/release-assets
-  ARTIFACT_PASSWORD: Sesame-AG
   RELEASE_TAG_RAW: ${{ inputs.release_tag || github.event.release.tag_name || github.ref_name }}
   RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && github.ref || format('refs/tags/{0}', github.event.release.tag_name || github.ref_name) }}
   TARGET_SOURCE_BRANCH: main
@@ -220,7 +219,7 @@ jobs:
     if: needs.preflight.outputs.ready == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     env:
       HAS_ANDROID_SIGNING_SECRETS: ${{ secrets.ANDROID_SIGNING_KEY != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
 
@@ -564,27 +563,21 @@ jobs:
           fi
           echo "asset_dir=${ASSET_DIR}" >> "$GITHUB_OUTPUT"
 
-      - name: Package APK Artifact
+      - name: Upload Release Assets
         if: env.PUBLISH_TO_XPOSED_REPO != 'true'
-        id: package_artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          artifact_path="${RUNNER_TEMP}/Sesame-AG-${RELEASE_TAG_RAW}.zip"
-          (
-            cd "${ASSET_DIR}"
-            zip -r -P "${ARTIFACT_PASSWORD}" "${artifact_path}" .
-          )
-          echo "artifact_path=${artifact_path}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload APK Artifact
-        if: env.PUBLISH_TO_XPOSED_REPO != 'true'
-        uses: actions/upload-artifact@v7
+        uses: softprops/action-gh-release@v2
         with:
-          name: Sesame-AG-${{ env.RELEASE_TAG_RAW }}
-          archive: false
-          path: ${{ steps.package_artifact.outputs.artifact_path }}
-          if-no-files-found: error
+          name: ${{ needs.preflight.outputs.version_name }}
+          files: |
+            ${{ steps.prepare_assets.outputs.asset_dir }}/*
+          token: ${{ github.token }}
+          tag_name: ${{ env.RELEASE_TAG_RAW }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          body_path: ${{ steps.release_notes.outputs.body_path }}
 
       - name: Sync Release to Target Repository
         if: env.PUBLISH_TO_XPOSED_REPO == 'true'
