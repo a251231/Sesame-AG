@@ -5,7 +5,6 @@ import java.util.TimeZone
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.rikka.tools.refine)
 }
@@ -14,30 +13,30 @@ var isCIBuild: Boolean = System.getenv("CI").toBoolean()
 //isCIBuild = true // 没有c++源码时开启CI构建, push前关闭
 
 android {
-    namespace = "fansirsqi.xposed.sesame"
+    namespace = "io.github.aoguai.sesameag"
     compileSdk = 36
     packaging {
         jniLibs {
             useLegacyPackaging = true
         }
-        splits {
-            abi {
-                isEnable = true
-                reset()
-                include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-                isUniversalApk = true
-            }
+    }
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            isUniversalApk = true
         }
-
     }
     // 使用providers API来支持配置缓存
     val gitCommitCount: Int = providers.exec {
         commandLine("git", "rev-list", "--count", "HEAD")
     }.standardOutput.asText.get().trim().toIntOrNull() ?: 1
+    val appVersionName: String = providers.gradleProperty("appVersion").orElse("0.0.1").get()
     defaultConfig {
         vectorDrawables.useSupportLibrary = true
-        applicationId = "fansirsqi.xposed.sesame"
-        minSdk = 26
+        applicationId = "io.github.aoguai.sesameag"
+        minSdk = 29
         targetSdk = 36
 
         val buildDate = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).apply {
@@ -49,7 +48,7 @@ android {
         }.format(Date())
 
         versionCode = gitCommitCount
-        versionName = "0.9.9"
+        versionName = appVersionName
 
         buildConfigField("String", "BUILD_DATE", "\"$buildDate\"")
         buildConfigField("String", "BUILD_TIME", "\"$buildTime\"")
@@ -58,16 +57,13 @@ android {
                 abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
             }
         }
-
-        testOptions {
-            unitTests.all {
-                it.enabled = false
-            }
-        }
     }
 
-
-
+    testOptions {
+        unitTests.all {
+            it.enabled = false
+        }
+    }
     buildFeatures {
         viewBinding = true
         buildConfig = true
@@ -79,11 +75,6 @@ android {
         isCoreLibraryDesugaringEnabled = false//关闭脱糖
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-    kotlin {
-        compilerOptions {
-            jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
-        }
     }
 
     signingConfigs {
@@ -111,7 +102,7 @@ android {
 
     sourceSets {
         getByName("main") {
-            jniLibs.srcDirs("src/main/jniLibs")
+            jniLibs.setSrcDirs(listOf("src/main/jniLibs"))
         }
     }
     val cmakeFile = file("src/main/cpp/CMakeLists.txt")
@@ -124,15 +115,25 @@ android {
             }
         }
     }
+}
 
-    applicationVariants.all {
-        val variant = this
-        variant.outputs.all {
-            val output = this
-            val abiName = output.filters.find { it.filterType == "ABI" }?.identifier ?: "universal"
-            val fileName = "Sesame-TK-${abiName}-${variant.versionName}.apk"
-            (output as com.android.build.gradle.internal.api.BaseVariantOutputImpl).outputFileName = fileName
-        }
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+composeCompiler {
+    // AGP 9.0 uses built-in Kotlin 2.2.10. Keep release builds away from
+    // Compose stack-trace/tooling metadata that triggers compose mapping generation.
+    generateFunctionKeyMetaClasses.set(false)
+    includeSourceInformation.set(false)
+    includeTraceMarkers.set(false)
+}
+
+tasks.configureEach {
+    if (name == "produceReleaseComposeMapping") {
+        enabled = false
     }
 }
 
@@ -190,16 +191,11 @@ dependencies {
     implementation(libs.webkit)                     // WebView 组件
 
     // 仅编译时依赖 - Xposed 相关
-    compileOnly(files("libs/api-82.jar"))          // Xposed API 82
-    compileOnly(files("libs/api-100.aar"))         // Xposed API 100 https://github.com/libxposed/api
-    implementation(files("libs/interface-100.aar")) // Xposed 模块接口 https://github.com/libxposed/api
-    implementation(files("libs/service-100-1.0.0.aar"))  // https://github.com/libxposed/service
+    compileOnly(libs.libxposed.api)                // Xposed API 101 https://github.com/libxposed/api
+    implementation(libs.libxposed.service)         // https://github.com/libxposed/service
 
     // 代码生成和工具库
-    compileOnly(libs.lombok)                       // Lombok 注解处理器（编译时）
-    annotationProcessor(libs.lombok)               // Lombok 注解处理
     implementation(libs.okhttp)                    // OkHttp 网络请求库
-    implementation(libs.dexkit)                    // DEX 文件分析工具
     implementation(libs.jackson.kotlin)            // Jackson Kotlin 支持
 
     // 核心库脱糖和系统 API 访问

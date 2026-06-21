@@ -21,8 +21,8 @@ env:
   ANDROID_API_LEVEL: "36"
   ANDROID_BUILD_TOOLS: "36.0.0"
   LOCAL_GRADLE_VERSION: "9.4.0-milestone-3"
-  LOCAL_AGP_VERSION: "8.9.3"
-  LOCAL_KOTLIN_VERSION: "2.3.0"
+  LOCAL_AGP_VERSION: "9.0.1"
+  LOCAL_KOTLIN_VERSION: "2.2.10"
   RELEASE_DIR: app/build/outputs/apk/release
   STAGING_DIR: app/build/outputs/apk/all
   ASSET_DIR: app/build/outputs/apk/release-assets
@@ -73,7 +73,7 @@ jobs:
           grep -Eq '^distributionUrl=.*gradle-'"${LOCAL_GRADLE_VERSION//./\\.}"'-bin\.zip$' gradle/wrapper/gradle-wrapper.properties
           grep -Eq '^android-plugin = "'"${LOCAL_AGP_VERSION//./\\.}"'"$' gradle/libs.versions.toml
           grep -Eq '^kotlin = "'"${LOCAL_KOTLIN_VERSION//./\\.}"'"$' gradle/libs.versions.toml
-          grep -Eq 'versionName = "[^"]+"' app/build.gradle.kts
+          grep -Eq '^appVersion=.+' gradle.properties
           grep -Eq 'compileSdk = '"${ANDROID_API_LEVEL}"'$' app/build.gradle.kts
           grep -Eq 'sourceCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
           grep -Eq 'targetCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts
@@ -95,9 +95,9 @@ jobs:
             version_name="${BASH_REMATCH[2]}"
           fi
 
-          configured_version_name="$(sed -n 's/^[[:space:]]*versionName = "\([^"]\+\)".*/\1/p' app/build.gradle.kts | head -n1 | tr -d '\r')"
+          configured_version_name="$(sed -n 's/^appVersion=//p' gradle.properties | head -n1 | tr -d '\r')"
           if [[ -z "${configured_version_name}" ]]; then
-            echo "Failed to resolve versionName from app/build.gradle.kts" >&2
+            echo "Failed to resolve appVersion from gradle.properties" >&2
             exit 1
           fi
 
@@ -153,14 +153,14 @@ jobs:
           elif [[ "${TAG_VALID}" != "true" ]]; then
             reason="标签 ${RELEASE_TAG_RAW} 不符合 Xposed 要求的 VersionCode-VersionName 格式"
           elif [[ "${VERSION_NAME}" != "${CONFIGURED_VERSION_NAME}" ]]; then
-            reason="标签中的 versionName (${VERSION_NAME}) 与 app/build.gradle.kts 中配置的 versionName (${CONFIGURED_VERSION_NAME}) 不一致"
+            reason="标签中的 versionName (${VERSION_NAME}) 与 gradle.properties 中配置的 appVersion (${CONFIGURED_VERSION_NAME}) 不一致"
           elif [[ "${TAG_VERSION_CODE}" != "${VERSION_CODE}" ]]; then
             reason="标签中的 versionCode (${TAG_VERSION_CODE}) 与当前提交计算得到的 versionCode (${VERSION_CODE}) 不一致"
           elif ! git merge-base --is-ancestor HEAD "origin/${TARGET_SOURCE_BRANCH}"; then
             reason="标签 ${RELEASE_TAG_RAW} 指向的提交不在 ${TARGET_SOURCE_BRANCH} 分支上"
           elif [[ "${PUBLISH_TO_XPOSED_REPO}" != "true" ]]; then
             ready="true"
-            reason="预检通过，将打包本仓库构建产物"
+            reason="预检通过"
           else
             api_url="https://api.github.com/repos/${TARGET_MODULE_REPO}"
             if http_code="$(curl -sS -o target_repo.json -w "%{http_code}" \
