@@ -161,6 +161,10 @@ class AntSesameCredit : ModelTask() {
         val failedCandidate: SesameCheckInCandidate? = null
     )
 
+    private data class SesameCheckInSceneSpec(
+        val completeTask: (String) -> String
+    )
+
     private data class ZhimaTreeAdTaskRef(
         val title: String,
         val rewardText: String,
@@ -1112,6 +1116,7 @@ class AntSesameCredit : ModelTask() {
         logPrefix: String,
         queryCheckIn: () -> String
     ): SesameCheckInExecutionResult {
+        val sceneSpec = buildSesameCheckInSceneSpec(sceneCode)
         var lastQueryRawResponse = ""
 
         fun queryCandidates(
@@ -1205,7 +1210,7 @@ class AntSesameCredit : ModelTask() {
                 )
             }
 
-            val completeResponse = AntSesameCreditRpcCall.zmCheckInCompleteTask(candidate.checkInDate, sceneCode)
+            val completeResponse = sceneSpec.completeTask(candidate.checkInDate)
             val completeJson = parseJSONObjectOrNull(completeResponse)
             if (completeJson == null) {
                 Log.error(
@@ -1262,6 +1267,19 @@ class AntSesameCredit : ModelTask() {
             completedCandidateCount = completedCandidateCount,
             remainingCandidateCount = 0
         )
+    }
+
+    private fun buildSesameCheckInSceneSpec(sceneCode: String): SesameCheckInSceneSpec {
+        return when (sceneCode) {
+            "alchemy" -> SesameCheckInSceneSpec { checkInDate ->
+                // Latest successful alchemy capture still carries this field even when it is empty.
+                AntSesameCreditRpcCall.alchemyCheckInCompleteTask(checkInDate)
+            }
+
+            else -> SesameCheckInSceneSpec { checkInDate ->
+                AntSesameCreditRpcCall.zmCheckInCompleteTask(checkInDate, sceneCode)
+            }
+        }
     }
 
     private fun extractSesameCheckInCandidates(response: JSONObject): List<SesameCheckInCandidate> {
