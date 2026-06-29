@@ -48,7 +48,6 @@ class BaseModel : Model() {
         modelFields.addField(waitWhenException) //异常发生时的等待时间
         modelFields.addField(errNotify) //异常通知开关
         modelFields.addField(setMaxErrorCount) //异常次数阈值
-        modelFields.addField(newRpc) //是否启用新接口
         modelFields.addField(customRpcScheduleEnable) //自定义RPC(配置文件+定时执行)
         modelFields.addField(debugMode) //是否开启抓包调试模式
         modelFields.addField(captureLogFileMaxSizeMb) //抓包日志文件滚动大小
@@ -215,13 +214,6 @@ class BaseModel : Model() {
 
         val setMaxErrorCount: IntegerModelField = IntegerModelField("setMaxErrorCount", "异常次数阈值", 8).withDesc(
             "网络或 RPC 连续异常达到该次数后进入离线冷却，并可结合异常通知提醒。"
-        )
-
-        /**
-         * 是否启用新接口（最低支持版本 v10.3.96.8100）
-         */
-        val newRpc: BooleanModelField = BooleanModelField("newRpc", "使用新接口(最低支持v10.3.96.8100)", false).withDesc(
-            "优先使用新版 RPC 桥接接口；低版本目标应用不兼容时再考虑关闭。"
         )
 
         /**

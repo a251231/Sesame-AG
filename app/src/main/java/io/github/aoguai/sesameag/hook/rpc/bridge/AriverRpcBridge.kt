@@ -87,15 +87,14 @@ private fun boxType(type: Class<*>): Class<*> {
 }
 
 /**
- * 新版RPC接口，支持最低支付宝版本v10.3.96.8100
- * 记录RPC抓包，支持最低支付宝版本v10.3.96.8100
+ * 当前 RPC 桥接实现，最低支持支付宝版本 v10.3.96.8100。
  */
-class NewRpcBridge : RpcBridge {
+class AriverRpcBridge : RpcBridge {
     private var loader: ClassLoader? = null
-    private var newRpcInstance: Any? = null
+    private var rpcBridgeExtensionInstance: Any? = null
     private var parseObjectMethod: Method? = null
     private var bridgeCallbackClazzArray: Array<Class<*>>? = null
-    private var newRpcCallMethod: Method? = null
+    private var rpcCallMethod: Method? = null
     private val maxErrorCount = AtomicInteger(0)
     private val setMaxErrorCount: Int = BaseModel.setMaxErrorCount.value ?: 10
 
@@ -244,8 +243,6 @@ class NewRpcBridge : RpcBridge {
         return methodName != null && !silentErrorMethods.contains(methodName)
     }
 
-    override fun getVersion(): RpcVersion = RpcVersion.NEW
-
     override fun load() {
         loader = io.github.aoguai.sesameag.hook.ApplicationHook.classLoader
         val classLoader = loader ?: run {
@@ -265,12 +262,12 @@ class NewRpcBridge : RpcBridge {
                 Class::class.java
             )
             getExtensionByName.isAccessible = true
-            newRpcInstance = getExtensionByName.invoke(
+            rpcBridgeExtensionInstance = getExtensionByName.invoke(
                 null,
                 classLoader.loadClass("com.alibaba.ariver.commonability.network.rpc.RpcBridgeExtension")
             )
 
-            if (newRpcInstance == null) {
+            if (rpcBridgeExtensionInstance == null) {
                 val nodeExtensionMap = callMethod(extensionManager, "getNodeExtensionMap")
                 if (nodeExtensionMap != null) {
                     @Suppress("UNCHECKED_CAST")
@@ -278,15 +275,15 @@ class NewRpcBridge : RpcBridge {
                     for ((_, innerMap) in map) {
                         for ((key, value) in innerMap) {
                             if (key == "com.alibaba.ariver.commonability.network.rpc.RpcBridgeExtension") {
-                                newRpcInstance = value
+                                rpcBridgeExtensionInstance = value
                                 break
                             }
                         }
                     }
                 }
-                if (newRpcInstance == null) {
-                    Log.runtime(TAG, "get newRpcInstance null")
-                    throw RuntimeException("get newRpcInstance is null")
+                if (rpcBridgeExtensionInstance == null) {
+                    Log.runtime(TAG, "get rpcBridgeExtensionInstance null")
+                    throw RuntimeException("get rpcBridgeExtensionInstance is null")
                 }
             }
 
@@ -297,8 +294,8 @@ class NewRpcBridge : RpcBridge {
             )
             bridgeCallbackClazzArray = arrayOf(bridgeCallbackClazz)
             
-            val rpcInstance = newRpcInstance ?: throw RuntimeException("newRpcInstance is null")
-            newRpcCallMethod = rpcInstance.javaClass.getMethod(
+            val rpcInstance = rpcBridgeExtensionInstance ?: throw RuntimeException("rpcBridgeExtensionInstance is null")
+            rpcCallMethod = rpcInstance.javaClass.getMethod(
                 "rpc",
                 String::class.java,
                 Boolean::class.javaPrimitiveType,
@@ -317,31 +314,30 @@ class NewRpcBridge : RpcBridge {
                 classLoader.loadClass("com.alibaba.ariver.engine.api.bridge.model.ApiContext"),
                 bridgeCallbackClazz
             )
-            Log.runtime(TAG, "get newRpcCallMethod successfully")
+            Log.runtime(TAG, "get rpcCallMethod successfully")
         } catch (e: Exception) {
-            Log.runtime(TAG, "get newRpcCallMethod err:")
+            Log.runtime(TAG, "get rpcCallMethod err:")
             throw e
         }
     }
 
     override fun unload() {
-        newRpcCallMethod = null
+        rpcCallMethod = null
         bridgeCallbackClazzArray = null
         parseObjectMethod = null
-        newRpcInstance = null
+        rpcBridgeExtensionInstance = null
         loader = null
     }
 
     override fun requestString(rpcEntity: RpcEntity, tryCount: Int, retryInterval: Int): String? {
-        val resRpcEntity = requestObject(rpcEntity, tryCount, retryInterval)
-        return resRpcEntity?.responseString
+        return requestObject(rpcEntity, tryCount, retryInterval)?.responseString
     }
 
     override fun requestObject(rpcEntity: RpcEntity, tryCount: Int, retryInterval: Int): RpcEntity? {
         // 方法开始时，将成员变量赋值给局部变量，以避免在方法执行期间因其他线程的unload()调用而导致成员变量变为null
-        var localNewRpcCallMethod = newRpcCallMethod
+        var localRpcCallMethod = rpcCallMethod
         var localParseObjectMethod = parseObjectMethod
-        var localNewRpcInstance = newRpcInstance
+        var localRpcBridgeExtensionInstance = rpcBridgeExtensionInstance
         var localLoader = loader
         var localBridgeCallbackClazzArray = bridgeCallbackClazzArray
         val captureMethodName = rpcEntity.requestMethod
@@ -362,14 +358,14 @@ class NewRpcBridge : RpcBridge {
         val normalizedTryCount = tryCount.coerceAtLeast(1)
 
         // 如果RPC组件未准备好，尝试重新初始化一次
-        if (localNewRpcCallMethod == null) {
+        if (localRpcCallMethod == null) {
             Log.debug(TAG, "RPC方法为null，尝试重新初始化...")
             try {
                 load()
                 // 重新加载初始化后的变量
-                localNewRpcCallMethod = newRpcCallMethod
+                localRpcCallMethod = rpcCallMethod
                 localParseObjectMethod = parseObjectMethod
-                localNewRpcInstance = newRpcInstance
+                localRpcBridgeExtensionInstance = rpcBridgeExtensionInstance
                 localLoader = loader
                 localBridgeCallbackClazzArray = bridgeCallbackClazzArray
                 Log.debug(TAG, "RPC重新初始化成功")
@@ -382,8 +378,8 @@ class NewRpcBridge : RpcBridge {
             }
         }
 
-        if (localNewRpcCallMethod == null || localParseObjectMethod == null ||
-            localNewRpcInstance == null || localLoader == null || localBridgeCallbackClazzArray == null
+        if (localRpcCallMethod == null || localParseObjectMethod == null ||
+            localRpcBridgeExtensionInstance == null || localLoader == null || localBridgeCallbackClazzArray == null
         ) {
             logNullResponse(rpcEntity, "RPC组件不完整", 0)
             captureNote = "rpc_component_incomplete"
@@ -401,8 +397,8 @@ class NewRpcBridge : RpcBridge {
                     }
                     RpcIntervalLimit.enterIntervalLimit(requestMethod)
                     val finalLocalBridgeCallbackClazzArray = localBridgeCallbackClazzArray
-                    localNewRpcCallMethod.invoke(
-                        localNewRpcInstance,
+                    localRpcCallMethod.invoke(
+                        localRpcBridgeExtensionInstance,
                         rpcEntity.requestMethod,
                         false,
                         false,
@@ -462,7 +458,7 @@ class NewRpcBridge : RpcBridge {
                                                     logErrorSummary(methodName, errorCode, errorMessage)
                                                 } else if (shouldShowErrorLog(methodName)) {
                                                     val message = buildString {
-                                                        append("new rpc response1 | id: ")
+                                                        append("rpc response1 | id: ")
                                                         append(rpcEntity.hashCode())
                                                         append(" | method: ")
                                                         append(rpcEntity.requestMethod)
@@ -485,7 +481,7 @@ class NewRpcBridge : RpcBridge {
                                             rpcEntity.setError()
                                             Log.error(
                                                 TAG,
-                                                "new rpc response2 | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} err:"
+                                                "rpc response2 | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} err:"
                                             )
                                             Log.printStackTrace(e)
                                         }
@@ -602,7 +598,7 @@ class NewRpcBridge : RpcBridge {
                     } catch (e: Exception) {
                         Log.error(
                             TAG,
-                            "new rpc response | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} get err:"
+                            "rpc response | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} get err:"
                         )
                         Log.printStackTrace(e)
                         captureNote = "response_parse_exception:${e.javaClass.simpleName}"
@@ -614,7 +610,7 @@ class NewRpcBridge : RpcBridge {
                 } catch (t: Throwable) {
                     Log.error(
                         TAG,
-                        "new rpc request | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} err:"
+                        "rpc request | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} err:"
                     )
                     Log.printStackTrace(t)
                     captureNote = "request_exception:${t.javaClass.simpleName}"
@@ -709,7 +705,7 @@ class NewRpcBridge : RpcBridge {
     }
 
     companion object {
-        private val TAG = NewRpcBridge::class.java.simpleName
+        private val TAG = AriverRpcBridge::class.java.simpleName
 
         private const val NULL_RESPONSE_LOG_INTERVAL_MS: Long = 5_000L
         private const val ERROR_SUMMARY_WINDOW_MS: Long = 10 * 60_000L
