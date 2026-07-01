@@ -2297,18 +2297,21 @@ class AntForest : ModelTask(), EnergyCollectCallback {
                     Log.forest("[$userName]被能量罩❤️保护着哟，跳过收取")
                 }
 
-                // 🆕【核心修改】检查炸弹卡 及 阈值判断逻辑
+                // 仅按本次实际可收的能量球判断是否放宽炸弹卡阈值，避免等待中的大球误触发。
                 if (!hasProtection && hasBombCard(userHomeObj, serverTime)) {
                     var bypassBomb = false
                     val bombLimit = collectBombEnergyLimit?.value ?: 0
 
-                    // 如果设定了阈值(>0)，检查是否有大额能量球值得冒险
                     if (bombLimit > 0) {
+                        val availableBubbleIdSet = availableBubbles.toHashSet()
                         val bubbles = userHomeObj.optJSONArray("bubbles")
                         if (bubbles != null) {
                             for (i in 0 until bubbles.length()) {
                                 val bubble = bubbles.getJSONObject(i)
-                                // 获取能量值 (fullEnergy通常是当前可收取的能量)
+                                val bubbleId = bubble.optLong("id")
+                                if (!availableBubbleIdSet.contains(bubbleId)) {
+                                    continue
+                                }
                                 val energy = bubble.optInt("fullEnergy", 0)
                                 if (energy >= bombLimit) {
                                     bypassBomb = true
@@ -2364,34 +2367,15 @@ class AntForest : ModelTask(), EnergyCollectCallback {
     }
 
     /**
-     * {{ 新增辅助方法：统一判断是否满足收自己能量的阈值条件 }}
-     * @param bubbleCount 能量球数值
-     * @param canBeRobbedAgain 是否可被再次偷取（保底状态为false）
+     * 统一判断是否满足收自己能量的阈值条件。
      */
-    private fun shouldCollectSelfBubble(bubbleCount: Int, canBeRobbedAgain: Boolean): Boolean {
+    private fun shouldCollectSelfBubble(bubbleCount: Int): Boolean {
         val type = collectSelfEnergyType?.value ?: CollectSelfType.ALL
         val threshold = collectSelfEnergyThreshold?.value ?: 0
 
         return when (type) {
-            CollectSelfType.OVER_THRESHOLD -> {
-                // 模式：大于阈值才收
-                // 逻辑：只有当 [小于阈值] 且 [还能被偷] 时才跳过 (不收)
-                // 如果已经到底了(!canBeRobbedAgain)，即使小于阈值也应该收回来，防止浪费
-                if (bubbleCount < threshold && canBeRobbedAgain) {
-                    false
-                } else {
-                    // 满足阈值 OR 触发保底收取 (能量很少了，朋友偷不走，必须自己收，不然就浪费了)
-                    if (bubbleCount < threshold && !canBeRobbedAgain) {
-                        Log.forest("触发保底收取：能量[$bubbleCount g] < 阈值[$threshold g]，但已无法被偷，强制收取")
-                    }
-                    true
-                }
-            }
-            CollectSelfType.BELOW_THRESHOLD -> {
-                // 模式：小于阈值才收
-                bubbleCount < threshold
-            }
-            // CollectSelfType.ALL -> 默认 true
+            CollectSelfType.OVER_THRESHOLD -> bubbleCount >= threshold
+            CollectSelfType.BELOW_THRESHOLD -> bubbleCount < threshold
             else -> true
         }
     }
@@ -2459,12 +2443,8 @@ class AntForest : ModelTask(), EnergyCollectCallback {
 
             when (status) {
                 CollectStatus.AVAILABLE -> {
-                    // 🆕【修改点1】：可收取状态，统一调用阈值判断
                     if (isSelf) {
-                        // 获取是否还能被偷取的标记 (保底状态下该值为 false)
-                        val canBeRobbedAgain = bubble.optBoolean("canBeRobbedAgain", false)
-
-                        if (shouldCollectSelfBubble(bubbleCount, canBeRobbedAgain)) {
+                        if (shouldCollectSelfBubble(bubbleCount)) {
                             availableBubbles.add(bubbleId)
                         }
                     } else {
@@ -2482,14 +2462,8 @@ class AntForest : ModelTask(), EnergyCollectCallback {
                         continue
                     }
 
-                    // 🆕【修改点2】：蹲点任务也必须严格遵循收自己能量的阈值配置
                     if (isSelf) {
-                        // 对于等待中的球，我们暂时假设它是可被偷的(canBeRobbedAgain=true)以进行严格检查
-                        // 逻辑：如果只收>20g，现在有个5g的在等待，应该跳过，不加入蹲点队列
-                        // 如果有明确的canBeRobbedAgain字段则使用，否则默认为true
-                        val canBeRobbed = bubble.optBoolean("canBeRobbedAgain", true)
-                        if (!shouldCollectSelfBubble(bubbleCount, canBeRobbed)) {
-                            // 可选：Log.forest("跳过等待能量[$bubbleCount g] (不满足阈值配置)")
+                        if (!shouldCollectSelfBubble(bubbleCount)) {
                             continue
                         }
                     }
@@ -8020,7 +7994,7 @@ class AntForest : ModelTask(), EnergyCollectCallback {
                 val serverTime = selfHomeObj.optLong("now", System.currentTimeMillis())
 
                 // ✅ 核心逻辑点：
-                // 调用 extractBubbleInfo，该方法内部调用了 shouldCollectSelfBubble(bubbleCount, canBeRobbedAgain)
+                // 调用 extractBubbleInfo，该方法内部统一执行收自己能量的阈值判断。
                 // 从而严格执行了【收自己单个能量球方式】和【阈值】的判断逻辑。
                 // 只有符合条件的 bubbleId 才会加入 availableBubbles
                 extractBubbleInfo(selfHomeObj, serverTime, availableBubbles, UserMap.currentUid)
