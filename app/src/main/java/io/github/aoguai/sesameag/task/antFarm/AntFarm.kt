@@ -4535,13 +4535,10 @@ class AntFarm : ModelTask() {
                     val remainingFood = jo.optInt("foodStock", 0).coerceAtLeast(0)
                     Log.farm("${UserMap.getCurrentMaskName()}投喂小鸡🥣[180g]#剩余饲料${remainingFood}g")
 
-                    val interval = BaseModel.checkInterval.getConfigValue()?.toIntOrNull() ?: 0
                     val timeSendBackValue = timeSendBack?.value ?: 0
                     var timeSendBackAnimal = 0
-                    if (timeSendBackValue in 10..interval){
+                    if (timeSendBackValue >= 10) {
                         timeSendBackAnimal = timeSendBackValue
-                    } else if(timeSendBackValue > interval){
-                        Log.farm("设置个合理的喂食后赶鸡时间，建议 30 分钟")
                     }
                     if (sendBackAnimal?.value == true && timeSendBackAnimal > 0) {
                         try {

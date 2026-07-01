@@ -1383,6 +1383,15 @@ class AntSports : ModelTask() {
         return (syncStepCount.value ?: 0) > 0
     }
 
+    internal fun isEarliestSyncStepTimeAllowed(): Boolean {
+        return if (::earliestSyncStepTime.isInitialized) {
+            earliestSyncStepTime.isDisabled() || earliestSyncStepTime.hasReachedToday()
+        } else {
+            val defaultField = HourOfDayModelField("defaultEarliestSyncStepTime", "默认最早同步时间", "-1", allowDisable = true)
+            defaultField.isDisabled() || defaultField.hasReachedToday()
+        }
+    }
+
     internal fun registerPersistentSyncStepTask() {
         if (!isSyncStepEnabled() ||
             Status.hasFlagToday(StatusFlags.FLAG_ANTSPORTS_SYNC_STEP_DONE) ||
@@ -1438,11 +1447,7 @@ class AntSports : ModelTask() {
             return false
         }
 
-        return if (::earliestSyncStepTime.isInitialized) {
-            earliestSyncStepTime.hasReachedToday()
-        } else {
-            HourOfDayModelField("defaultEarliestSyncStepTime", "默认最早同步时间", "-1", allowDisable = true).hasReachedToday()
-        }
+        return isEarliestSyncStepTimeAllowed()
     }
 
     private fun queryCurrentWalkStepCount(): Int? {

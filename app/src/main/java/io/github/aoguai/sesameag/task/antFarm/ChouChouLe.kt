@@ -156,7 +156,8 @@ class ChouChouLe {
         val isTimeReached = antFarm.chouChouLeTrigger?.getTriggerSpec()?.let {
             TimeTriggerEvaluator.evaluateNow(it).allowNow
         } == true
-        val ignoreAcceLimitMode = !isGameEnabled || antFarm.ignoreAcceLimit?.value == true
+        val ignoreAcceLimitMode = antFarm.ignoreAcceLimit?.value == true
+        val isGamePrerequisiteReady = !isGameEnabled || isGameFinished
 
         when {
             ignoreAcceLimitMode -> {
@@ -166,10 +167,10 @@ class ChouChouLe {
                     Log.farm("当前处于按时抽抽乐模式，未到设定时间，跳过")
                 }
             }
-            isGameFinished -> {
+            isGamePrerequisiteReady -> {
                 executeAndSync(antFarm)
             }
-            !isGameFinished -> {
+            else -> {
                 Log.farm("游戏改分还没有完成，暂不执行抽抽乐")
             }
         }
