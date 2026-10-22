@@ -19,6 +19,7 @@ env:
   JAVA_DISTRIBUTION: "zulu"
   JAVA_VERSION: "17"
   ANDROID_API_LEVEL: "37"
+  ANDROID_PLATFORM: "android-37.0"
   ANDROID_BUILD_TOOLS: "37.0.0"
   LOCAL_GRADLE_VERSION: "9.5.1"
   LOCAL_AGP_VERSION: "9.2.1"
@@ -276,8 +277,19 @@ jobs:
           set -euo pipefail
           sdkmanager --install \
             "platform-tools" \
-            "platforms;android-${ANDROID_API_LEVEL}" \
+            "platforms;${ANDROID_PLATFORM}" \
             "build-tools;${ANDROID_BUILD_TOOLS}"
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "${sdk_root}" || ! -f "${sdk_root}/platforms/${ANDROID_PLATFORM}/android.jar" ]]; then
+            echo "Android SDK platform ${ANDROID_PLATFORM} was not installed correctly" >&2
+            exit 1
+          fi
+          # Some Android Gradle tooling still resolves compileSdk=37 as android-37.
+          # SDK Manager distributes API 37.0 as android-37.0; provide a safe alias.
+          legacy_platform="${sdk_root}/platforms/android-${ANDROID_API_LEVEL}"
+          if [[ "${ANDROID_PLATFORM}" == "android-${ANDROID_API_LEVEL}.0" && ! -e "${legacy_platform}" && ! -L "${legacy_platform}" ]]; then
+            ln -s "${ANDROID_PLATFORM}" "${legacy_platform}"
+          fi
           # `yes` will receive SIGPIPE after sdkmanager finishes reading input.
           # Run this pipeline without pipefail so the step reflects sdkmanager's exit code.
           set +o pipefail
