@@ -15,10 +15,9 @@ import io.github.aoguai.sesameag.model.modelFieldExt.SelectModelField
 import io.github.aoguai.sesameag.model.withDesc
 import io.github.aoguai.sesameag.task.ModelTask
 import io.github.aoguai.sesameag.task.antMember.AntMemberRpcCall
-import io.github.aoguai.sesameag.task.common.TaskFlowAction
+import io.github.aoguai.sesameag.task.common.DeferredReason
 import io.github.aoguai.sesameag.task.common.TaskFlowActionResult
 import io.github.aoguai.sesameag.task.common.TaskFlowAdapter
-import io.github.aoguai.sesameag.task.common.TaskFlowDecision
 import io.github.aoguai.sesameag.task.common.TaskFlowEngine
 import io.github.aoguai.sesameag.task.common.TaskFlowItem
 import io.github.aoguai.sesameag.task.common.TaskFlowPhase
@@ -28,14 +27,16 @@ import io.github.aoguai.sesameag.task.exchange.ExchangeCost
 import io.github.aoguai.sesameag.task.exchange.ExchangeDisplayMeta
 import io.github.aoguai.sesameag.task.exchange.ExchangeItem
 import io.github.aoguai.sesameag.task.exchange.ExchangeLimit
+import io.github.aoguai.sesameag.task.exchange.ExchangeFetchPacing
 import io.github.aoguai.sesameag.task.exchange.ExchangeOptionRow
 import io.github.aoguai.sesameag.task.exchange.ExchangeOptionsCache
+import io.github.aoguai.sesameag.task.exchange.ExchangeOptionsSnapshot
 import io.github.aoguai.sesameag.task.exchange.ExchangeSafety
 import io.github.aoguai.sesameag.task.exchange.ExchangeSafetyRules
 import io.github.aoguai.sesameag.util.JsonUtil
 import io.github.aoguai.sesameag.util.Log
 import io.github.aoguai.sesameag.util.ResChecker
-import io.github.aoguai.sesameag.util.TaskBlacklist
+import io.github.aoguai.sesameag.util.RpcOfflineRisk
 import io.github.aoguai.sesameag.util.maps.IdMapManager
 import io.github.aoguai.sesameag.util.maps.MyBankWelfareBenefitMap
 import io.github.aoguai.sesameag.util.maps.UserMap
@@ -147,6 +148,13 @@ class MyBankWelfare : ModelTask() {
     }
 
     private fun refreshMyBankWelfareExchangeOptionsForSettings(): List<MapperEntity> {
+        val freshRows = ExchangeOptionsCache.loadTodaySnapshot(
+            UserMap.currentUid, ExchangeOptionsRefreshBridge.TARGET_MYBANK_WELFARE
+        )?.rows
+        if (freshRows != null) {
+            Log.mybank("${BUSINESS_NAME}🎐设置页使用新鲜缓存#${freshRows.size}")
+            return freshRows
+        }
         if (!HookReadyChecker.isCurrentProcessReadyForRpc(UserMap.currentUid)) {
             val cachedRows = ExchangeOptionsCache.loadForSettingsCache(
                 UserMap.currentUid,
@@ -193,19 +201,18 @@ class MyBankWelfare : ModelTask() {
         return rows
     }
 
-    internal fun refreshMyBankWelfareExchangeOptionsForRemote(): List<ExchangeOptionRow> =
-        refreshMyBankWelfareExchangeOptionsFromRpc()
+    internal fun refreshMyBankWelfareExchangeOptionsForRemote(forceRefresh: Boolean = false): List<ExchangeOptionRow> =
+        refreshMyBankWelfareExchangeOptionsFromRpc(forceRefresh)
 
-    private fun refreshMyBankWelfareExchangeOptionsFromRpc(): List<ExchangeOptionRow> {
+    private fun refreshMyBankWelfareExchangeOptionsFromRpc(forceRefresh: Boolean = false): List<ExchangeOptionRow> {
         try {
             val userId = UserMap.currentUid
-            val exchangeData = queryMyBankWelfareExchangeData()
+            val exchangeData = queryMyBankWelfareExchangeData(forceRefresh)
             val benefitMap = IdMapManager.getInstance(MyBankWelfareBenefitMap::class.java)
             exchangeData.rows.forEach { row ->
                 benefitMap.add(row.id, row.name)
             }
             benefitMap.save(userId)
-            ExchangeOptionsCache.save(userId, ExchangeOptionsRefreshBridge.TARGET_MYBANK_WELFARE, exchangeData.rows)
             Log.mybank("${BUSINESS_NAME}🎐刷新兑换列表#${exchangeData.rows.size}")
             return exchangeData.rows
         } catch (t: Throwable) {
@@ -214,41 +221,64 @@ class MyBankWelfare : ModelTask() {
         }
     }
 
-    private fun queryMyBankWelfareExchangeData(): MyBankWelfareExchangeData {
-        val candidateMap = LinkedHashMap<String, MyBankWelfareExchangeCandidate>()
-        queryMyBankRightsCandidates(candidateMap)
-        val rows = candidateMap.values.map { it.item.toOptionRow() }
-        return MyBankWelfareExchangeData(rows, candidateMap)
+    private fun queryMyBankWelfareExchangeData(forceRefresh: Boolean = false): MyBankWelfareExchangeData {
+        fun parse(payload: JSONObject): LinkedHashMap<String, MyBankWelfareExchangeCandidate> {
+            val candidates = LinkedHashMap<String, MyBankWelfareExchangeCandidate>()
+            val items = payload.getJSONArray("items")
+            for (i in 0 until items.length()) {
+                val candidate = buildMyBankExchangeCandidate(items.getJSONObject(i)) ?: continue
+                candidates.putIfAbsent(candidate.item.id, candidate)
+            }
+            return candidates
+        }
+        val snapshot = ExchangeOptionsCache.getOrFetch(UserMap.currentUid, ExchangeOptionsRefreshBridge.TARGET_MYBANK_WELFARE, forceRefresh) { session ->
+            val payload = JSONObject().put("items", queryMyBankRightsCandidates(session))
+            ExchangeOptionsSnapshot(parse(payload).values.map { it.item.toOptionRow() }, payload)
+        }
+        val candidates = parse(snapshot.payload)
+        return MyBankWelfareExchangeData(candidates.values.map { it.item.toOptionRow() }, candidates)
     }
 
-    private fun queryMyBankRightsCandidates(
-        candidateMap: LinkedHashMap<String, MyBankWelfareExchangeCandidate>
-    ) {
+    private fun queryMyBankRightsCandidates(session: io.github.aoguai.sesameag.task.exchange.ExchangeFetchSession): JSONArray {
+        val items = JSONArray()
+        val seenItemIds = linkedSetOf<String>()
         var pageNum = 1
         var totalCount = Int.MAX_VALUE
         val pageSize = 20
         while ((pageNum - 1) * pageSize < totalCount) {
-            val response = JSONObject(MyBankWelfareRpcCall.queryItemsInMemberV2(pageNum = pageNum, perPageSize = pageSize))
-            if (!ResChecker.checkRes(TAG, "${BUSINESS_NAME}权益列表查询失败:", response)) {
-                break
+            val response = session.read("items", JSONObject().put("pageNum", pageNum).put("pageSize", pageSize), "权益第 $pageNum 页") {
+                JSONObject(MyBankWelfareRpcCall.queryItemsInMemberV2(pageNum = pageNum, perPageSize = pageSize))
             }
-            val pageItems = response.optJSONObject("result")
-                ?.optJSONObject("pageItems")
-                ?: break
-            val dataList = pageItems.optJSONArray("dataList") ?: break
-            if (dataList.length() == 0) {
-                break
-            }
-            for (i in 0 until dataList.length()) {
-                val candidate = buildMyBankExchangeCandidate(dataList.optJSONObject(i) ?: continue) ?: continue
-                candidateMap.putIfAbsent(candidate.item.id, candidate)
-            }
+            check(ResChecker.checkRes(TAG, "${BUSINESS_NAME}权益列表查询失败:", response)) { "网商银行福利金权益列表查询失败" }
+            val pageItems = response.getJSONObject("result").getJSONObject("pageItems")
+            val dataList = pageItems.getJSONArray("dataList")
             totalCount = pageItems.optInt("totalCount", totalCount)
+            val seenCount = seenItemIds.size
+            for (i in 0 until dataList.length()) {
+                val item = dataList.getJSONObject(i)
+                items.put(item)
+                val itemId = item.optString("itemId").trim()
+                    .ifBlank { item.optJSONObject("itemConfigDTO")?.optString("itemId").orEmpty().trim() }
+                    .ifBlank { parseNestedItemInfo(item)?.optString("itemId").orEmpty().trim() }
+                if (itemId.isNotBlank()) seenItemIds.add(itemId)
+            }
             if (dataList.length() < pageSize) {
+                check(totalCount == Int.MAX_VALUE || items.length() >= totalCount) { "网商银行福利金列表尚有未拉取商品" }
+                session.commit(JSONObject().put("done", true).put("totalCount", totalCount), dataList.length(), "分页结束，保存完整列表")
                 break
             }
             pageNum++
+            val hasMore = (pageNum - 1) * pageSize < totalCount
+            if (hasMore) {
+                check(seenItemIds.size > seenCount) {
+                    "网商银行福利金分页未前进: pageNum=${pageNum - 1} count=${dataList.length()} totalCount=$totalCount"
+                }
+            }
+            session.commit(JSONObject().put("pageNum", pageNum).put("totalCount", totalCount).put("done", !hasMore),
+                dataList.length(), if (hasMore) "权益第 $pageNum 页" else "分页结束，保存完整列表")
+            if (hasMore) session.pageTurnDelay()
         }
+        return items
     }
 
     private fun buildMyBankExchangeCandidate(
@@ -536,8 +566,12 @@ class MyBankWelfare : ModelTask() {
             setFlagToday(StatusFlags.FLAG_MYBANK_WELFARE_EXCHANGE_REFRESH_DONE)
             return
         }
+        val userId = UserMap.currentUid
+        if (selectedIds.isEmpty()) {
+            Log.mybank("${BUSINESS_NAME}🎐未勾选目标，跳过列表拉取")
+            return
+        }
         try {
-            val userId = UserMap.currentUid
             val exchangeData = queryMyBankWelfareExchangeData()
             val benefitMap = IdMapManager.getInstance(MyBankWelfareBenefitMap::class.java)
             exchangeData.rows.forEach { row ->
@@ -601,9 +635,11 @@ class MyBankWelfare : ModelTask() {
                 Log.mybank("${BUSINESS_NAME}🎐跳过[${candidate.item.name}]#缺少benefitId")
                 return ExchangeAttemptResult()
             }
+            val cityCode = io.github.aoguai.sesameag.hook.internal.LocationHelper.requireCityCode()
             val detailResp = JSONObject(
                 AntMemberRpcCall.querySingleBenefitDetail(
                     benefitId = candidate.benefitId,
+                    cityCode = cityCode,
                     requestSourceInfo = candidate.requestSourceInfo,
                     sourcePassMap = candidate.sourcePassMap
                 )
@@ -663,6 +699,7 @@ class MyBankWelfare : ModelTask() {
                 AntMemberRpcCall.exchangeMemberBenefit(
                     benefitId = confirmedCandidate.benefitId,
                     itemId = confirmedCandidate.itemId,
+                    cityCode = cityCode,
                     requestSourceInfo = confirmedCandidate.requestSourceInfo,
                     sourcePassMap = confirmedCandidate.sourcePassMap
                 )
@@ -732,10 +769,10 @@ class MyBankWelfare : ModelTask() {
             val canRetry = result?.optBoolean("canRetry", false) == true
             if (signNotAdmit && !canRetry) {
                 Log.mybank("${BUSINESS_NAME}📅今日签到已处理")
+                setFlagToday(StatusFlags.FLAG_MYBANK_WELFARE_SIGN_DONE)
             } else {
                 Log.mybank("${BUSINESS_NAME}📅签到咨询成功")
             }
-            setFlagToday(StatusFlags.FLAG_MYBANK_WELFARE_SIGN_DONE)
         } catch (t: Throwable) {
             Log.printStackTrace(TAG, "handleSign err:", t)
         }
@@ -795,8 +832,8 @@ class MyBankWelfare : ModelTask() {
         override val moduleName: String = DISPLAY_NAME
         override val flowName: String = "${BUSINESS_NAME}任务"
 
-        private val signedUpTaskKeys = LinkedHashSet<String>()
-        private val sentTaskKeys = LinkedHashSet<String>()
+        override fun isFlowHandledToday(): Boolean =
+            hasFlagToday(StatusFlags.FLAG_MYBANK_WELFARE_TASKS_DONE)
 
         override fun query(): JSONObject {
             val response = MyBankWelfareRpcCall.taskQuery(TASK_CENTER_ID)
@@ -829,7 +866,6 @@ class MyBankWelfare : ModelTask() {
                     .ifBlank { taskDetail.optString("taskTitle").trim() }
                     .ifBlank { taskDetail.optString("title").trim() }
                     .ifBlank { taskId }
-                releaseTerminalTaskBlacklistIfNeeded(taskId, title, taskDetail.optString("taskProcessStatus"))
                 val current = when {
                     taskDetail.has("periodCurrentCompleteNum") -> taskDetail.optInt("periodCurrentCompleteNum")
                     taskDetail.has("taskCompleteTimes") -> taskDetail.optInt("taskCompleteTimes")
@@ -849,7 +885,7 @@ class MyBankWelfare : ModelTask() {
                         type = taskDetail.optString("sendCampTriggerType").trim(),
                         sceneCode = TASK_CENTER_ID,
                         actionType = morphoDetail.optString("tagType").trim(),
-                        blacklistKeys = listOf(taskId, title).filter { it.isNotBlank() },
+                        blacklistKeys = listOf(taskId),
                         raw = taskDetail,
                         progress = buildTaskProgress(current, limit),
                         current = current,
@@ -861,26 +897,27 @@ class MyBankWelfare : ModelTask() {
         }
 
         override fun mapPhase(item: TaskFlowItem): TaskFlowPhase {
+            val status = item.status.uppercase(Locale.ROOT)
+            if (status == "RECEIVE_SUCCESS") {
+                return TaskFlowPhase.TERMINAL
+            }
             if (item.type !in SUPPORTED_TRIGGER_TYPES) {
                 return TaskFlowPhase.UNSUPPORTED
             }
-            val taskKey = buildTaskKey(item)
-            return when (item.status.uppercase(Locale.ROOT)) {
-                "NONE_SIGNUP" -> if (taskKey in signedUpTaskKeys) {
-                    TaskFlowPhase.SIGNUP_COMPLETE
+            return when (status) {
+                "NONE_SIGNUP" -> TaskFlowPhase.SIGNUP_REQUIRED
+                "SIGNUP_COMPLETE" -> if (item.type == "EVENT_TRIGGER") {
+                    TaskFlowPhase.BUSINESS_ACTION
                 } else {
-                    TaskFlowPhase.SIGNUP_REQUIRED
+                    TaskFlowPhase.SIGNUP_COMPLETE
                 }
-
-                "SIGNUP_COMPLETE" -> TaskFlowPhase.SIGNUP_COMPLETE
-                "RECEIVE_SUCCESS" -> TaskFlowPhase.TERMINAL
                 else -> TaskFlowPhase.UNKNOWN
             }
         }
 
         override fun shouldSkip(item: TaskFlowItem): Boolean {
-            if (item.type !in SUPPORTED_TRIGGER_TYPES) {
-                val taskKey = buildTaskKey(item)
+            if (item.type.isNotBlank() && item.type !in SUPPORTED_TRIGGER_TYPES) {
+                val taskKey = item.id
                 if (loggedUnsupportedTaskKeys.add(taskKey)) {
                     logInfo(
                         "$flowName[跳过未支持触发类型：${item.title}] " +
@@ -890,11 +927,11 @@ class MyBankWelfare : ModelTask() {
                 }
                 return true
             }
-            return when (mapPhase(item)) {
-                TaskFlowPhase.SIGNUP_COMPLETE -> buildTaskKey(item) in sentTaskKeys
-                else -> false
-            }
+            return false
         }
+
+        override fun isUnresolvedWhenSkipped(item: TaskFlowItem): Boolean =
+            mapPhase(item) != TaskFlowPhase.TERMINAL && !super<TaskFlowAdapter>.isBlacklisted(item)
 
         override fun receive(item: TaskFlowItem): TaskFlowActionResult =
             TaskFlowActionResult.failure(
@@ -910,30 +947,15 @@ class MyBankWelfare : ModelTask() {
 
         override fun send(item: TaskFlowItem): TaskFlowActionResult = triggerTaskStage(item, "send")
 
-        override fun afterSuccess(item: TaskFlowItem, action: TaskFlowAction, result: TaskFlowActionResult) {
-            if (result.progressChanged) {
-                rememberSuccessfulStage(item, action)
-            }
-        }
-
-        override fun afterFailure(
-            item: TaskFlowItem,
-            action: TaskFlowAction,
-            result: TaskFlowActionResult,
-            decision: TaskFlowDecision
-        ) {
-            if (decision == TaskFlowDecision.MARK_HANDLED) {
-                rememberSuccessfulStage(item, action)
-            }
-        }
-
         override fun onAllTasksDone(snapshot: TaskFlowSnapshot) {
+            setFlagToday(StatusFlags.FLAG_MYBANK_WELFARE_TASKS_DONE)
             logInfo("$flowName[任务列表已处理完成：${snapshot.completedTasks}/${snapshot.totalTasks}]")
         }
 
         override fun onQueryFailed(response: JSONObject) {
-            Log.mybank(
-                "$flowName[任务查询失败]#${extractResponseCode(response).ifBlank { extractResponseMessage(response) }}"
+            Log.error(
+                TAG,
+                "$flowName[任务查询失败]#${extractResponseCode(response).ifBlank { extractResponseMessage(response) }} raw=$response"
             )
         }
 
@@ -942,7 +964,7 @@ class MyBankWelfare : ModelTask() {
         }
 
         override fun logError(message: String) {
-            Log.mybank(message)
+            Log.error(TAG, message)
         }
 
         private fun triggerTaskStage(item: TaskFlowItem, stageCode: String): TaskFlowActionResult {
@@ -973,32 +995,6 @@ class MyBankWelfare : ModelTask() {
                 stopCurrentRound = failureType == TaskRpcFailureType.RETRYABLE_RPC
             )
         }
-
-        private fun rememberSuccessfulStage(item: TaskFlowItem, action: TaskFlowAction) {
-            val taskKey = buildTaskKey(item)
-            when (action) {
-                TaskFlowAction.SIGNUP -> signedUpTaskKeys.add(taskKey)
-                TaskFlowAction.SEND,
-                TaskFlowAction.COMPLETE -> sentTaskKeys.add(taskKey)
-                TaskFlowAction.RECEIVE -> Unit
-            }
-        }
-
-        private fun releaseTerminalTaskBlacklistIfNeeded(taskId: String, title: String, status: String) {
-            val normalizedStatus = status.trim().uppercase(Locale.ROOT)
-            if (normalizedStatus !in setOf("RECEIVE_SUCCESS", "HAS_RECEIVED", "RECEIVED", "DONE", "COMPLETED")) {
-                return
-            }
-            if (taskId.isNotBlank()) {
-                TaskBlacklist.removeFromBlacklist(moduleName, taskId, title)
-                TaskBlacklist.removeFromBlacklist(moduleName, taskId)
-            }
-            if (title.isNotBlank()) {
-                TaskBlacklist.removeFromBlacklist(moduleName, title)
-            }
-        }
-
-        private fun buildTaskKey(item: TaskFlowItem): String = item.id.ifBlank { item.title }
 
         private fun buildTaskProgress(current: Int?, limit: Int?): String {
             return when {
@@ -1038,26 +1034,23 @@ class MyBankWelfare : ModelTask() {
                 response.optString("resultCode").equals("SUCCESS", ignoreCase = true) ||
                 response.optString("code") == "100000000"
             val prizeSendOrderList = response.optJSONObject("result")?.optJSONArray("prizeSendOrderList")
-            var hasSendSuccess = false
-            var hasBenefitPointPrize = false
+            var hasSuccessfulBenefitPointPrize = false
             if (prizeSendOrderList != null) {
                 for (i in 0 until prizeSendOrderList.length()) {
                     val prizeOrder = prizeSendOrderList.optJSONObject(i) ?: continue
-                    if (prizeOrder.optString("sendStatus") == "SUCCESS") {
-                        hasSendSuccess = true
-                    }
                     val prizeType = prizeOrder.optString("prizeType")
                     val prizeSubType = prizeOrder.optString("prizeSubType")
-                    if (prizeType == "MYBK_BENEFIT_POINT" || prizeSubType == "MYBK_BENEFIT_POINT") {
-                        hasBenefitPointPrize = true
+                    val isBenefitPointPrize =
+                        prizeType == "MYBK_BENEFIT_POINT" || prizeSubType == "MYBK_BENEFIT_POINT"
+                    if (isBenefitPointPrize && prizeOrder.optString("sendStatus") == "SUCCESS") {
+                        hasSuccessfulBenefitPointPrize = true
                     }
                 }
             }
             return when {
-                stageCode == "send" && (hasBenefitPointPrize || hasSendSuccess) -> TaskFlowActionResult.success()
-                stageCode == "send" && baseSuccess ->
+                stageCode == "send" && (hasSuccessfulBenefitPointPrize || baseSuccess) ->
                     TaskFlowActionResult.success(refreshAfterAction = true, progressChanged = false)
-                hasSendSuccess || baseSuccess -> TaskFlowActionResult.success()
+                baseSuccess -> TaskFlowActionResult.success(refreshAfterAction = true, progressChanged = false)
                 else -> null
             }
         }

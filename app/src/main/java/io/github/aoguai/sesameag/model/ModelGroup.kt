@@ -16,6 +16,8 @@ enum class ModelGroup(
     BASE("BASE", "基础", "svg/group/base.svg"),
     /** 森林 */
     FOREST("FOREST", "森林", "svg/group/forest.svg"),
+    /** 保护地巡护 */
+    FOREST_PATROL("FOREST_PATROL", "保护地巡护", "svg/group/forest.svg"),
     /** 神奇物种 */
     DODO("DODO", "神奇物种", "svg/group/forest.svg"),
     /** 庄园 */
@@ -24,8 +26,8 @@ enum class ModelGroup(
     STALL("STALL", "新村", "svg/group/stall.svg"),
     /** 农场 */
     ORCHARD("ORCHARD", "农场", "svg/group/orchard.svg"),
-    /** 福气鱼池 */
-    FISHPOND("FISHPOND", "福气鱼池", "svg/group/orchard.svg"),
+    /** 金豆夺宝 */
+    GOLDEN_BEAN("GOLDEN_BEAN", "金豆夺宝", "svg/group/golden_bean.svg"),
     /** 运动 */
     SPORTS("SPORTS", "运动", "svg/group/sports.svg"),
     /** 会员 */

@@ -3,21 +3,134 @@
 package io.github.aoguai.sesameag.util
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.os.Environment
 import com.fasterxml.jackson.core.type.TypeReference
 import io.github.aoguai.sesameag.data.General
 import io.github.aoguai.sesameag.entity.UserEntity
-import java.io.Closeable
 import java.io.File
 import java.io.FileWriter
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.io.IOException
-import java.io.InputStream
-import java.io.OutputStream
+import java.nio.file.StandardCopyOption
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import java.text.SimpleDateFormat
 import java.util.Date
+import org.json.JSONArray
+import org.json.JSONObject
 
 object Files {
     private val TAG = Files::class.java.simpleName
+    private val accountStorageLock = ReentrantLock()
+    private val lockedAccounts = ThreadLocal.withInitial { mutableSetOf<String>() }
+
+    /** 同一进程可重入，跨进程覆盖账号数据的整个读改写过程。 */
+    fun <T> withAccountLock(userId: String, action: () -> T): T = accountStorageLock.withLock {
+        require(userId.isNotBlank()) { "账号为空" }
+        io.github.aoguai.sesameag.task.TaskExecutionReport.current()?.ensureCurrent(userId)
+        val held = checkNotNull(lockedAccounts.get())
+        if (userId in held) return@withLock action()
+        RandomAccessFile(File(getUserConfigDir(userId), ".account.lock"), "rw").use { file ->
+            file.channel.lock().use {
+                held.add(userId)
+                try {
+                    recoverAccountTransaction(userId)
+                    action()
+                } finally {
+                    held.remove(userId)
+                }
+            }
+        }
+    }
+
+    /** 备份先落盘；未提交的多文件变更在下次账号读取前恢复。 */
+    fun <T> withAccountTransaction(userId: String, files: Collection<File>, action: () -> T): T =
+        withAccountLock(userId) {
+            val directory = getUserConfigDir(userId).canonicalFile
+            val journal = File(directory, ".account-transaction.json")
+            val committed = File(directory, ".account-transaction.committed")
+            check(!journal.exists() && !committed.exists()) { "账号存在未恢复的事务" }
+            val backup = JSONObject()
+            files.distinctBy { it.canonicalPath }.forEach { file ->
+                require(file.canonicalFile.parentFile == directory && !file.name.startsWith(".")) { "事务文件不属于目标账号" }
+                backup.put(file.name, if (file.exists()) file.readText(Charsets.UTF_8) else JSONObject.NULL)
+            }
+            check(writeAtomically(backup.toString(), journal)) { "保存账号事务备份失败" }
+            val result = try {
+                action().also {
+                    io.github.aoguai.sesameag.task.TaskExecutionReport.current()?.ensureCurrent(userId)
+                    check(writeAtomically("committed", committed)) { "提交账号事务失败" }
+                }
+            } catch (failure: Throwable) {
+                try {
+                    recoverAccountTransaction(userId)
+                } catch (rollback: Throwable) {
+                    throw IOException("操作失败且恢复不完整：${rollback.message}", failure).also {
+                        it.addSuppressed(rollback)
+                    }
+                }
+                throw failure
+            }
+            runCatching { recoverAccountTransaction(userId) }.onFailure {
+                Log.printStackTrace(TAG, "事务已提交，清理记录将在下次账号读取时重试", it)
+            }
+            result
+        }
+
+    private fun recoverAccountTransaction(userId: String) {
+        val directory = getUserConfigDir(userId)
+        val journal = File(directory, ".account-transaction.json")
+        val committed = File(directory, ".account-transaction.committed")
+        if (journal.exists() && !committed.exists()) {
+            val backup = JSONObject(journal.readText(Charsets.UTF_8))
+            val names = backup.keys()
+            val failed = mutableListOf<String>()
+            while (names.hasNext()) {
+                val name = names.next()
+                val file = File(directory, name)
+                require(file.canonicalFile.parentFile == directory.canonicalFile && !name.startsWith(".")) { "事务备份路径无效" }
+                val restored = if (backup.isNull(name)) !file.exists() || file.delete()
+                    else writeAtomically(backup.getString(name), file)
+                if (!restored) failed.add(name)
+            }
+            check(failed.isEmpty()) { "无法恢复文件：${failed.joinToString()}" }
+            Log.record(TAG, "已恢复未完成的账号文件事务")
+        }
+        check(!journal.exists() || journal.delete()) { "无法清理账号事务备份" }
+        check(!committed.exists() || committed.delete()) { "无法清理账号事务提交记录" }
+    }
+
+    fun writeAtomically(text: String, file: File): Boolean {
+        var temporary: File? = null
+        return try {
+            val parent = requireNotNull(file.parentFile)
+            check(parent.isDirectory || parent.mkdirs()) { "无法创建目录: $parent" }
+            temporary = File.createTempFile(".${file.name}.", ".tmp", parent)
+            FileOutputStream(temporary).use { output ->
+                output.write(text.toByteArray(Charsets.UTF_8))
+                output.fd.sync()
+            }
+            java.nio.file.Files.move(
+                temporary.toPath(), file.toPath(),
+                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING
+            )
+            true
+        } catch (e: Exception) {
+            Log.printStackTrace(TAG, "原子保存失败: ${file.name}", e)
+            false
+        } finally {
+            runCatching { temporary?.delete() }
+        }
+    }
+
+    data class ClearAllResult(
+        val failedPaths: List<String>
+    ) {
+        val success: Boolean
+            get() = failedPaths.isEmpty()
+    }
 
     const val CONFIG_DIR_NAME = "sesame-AG"
 
@@ -33,8 +146,7 @@ object Files {
     /**
      * 确保指定的目录存在且不是一个文件。
      */
-    @JvmStatic
-    fun ensureDir(directory: File?) {
+    private fun ensureDir(directory: File?) {
         try {
             if (directory == null) {
                 android.util.Log.e(TAG, "Directory cannot be null")
@@ -81,6 +193,21 @@ object Files {
         ensureDir(configDir)
         return configDir
     }
+
+    /** Lists existing account configuration directories without creating or migrating files. */
+    @JvmStatic
+    @JvmOverloads
+    fun listExistingUserConfigIds(requireReadable: Boolean = false): List<String> =
+        (CONFIG_DIR.listFiles() ?: if (requireReadable) {
+            throw IOException("account_config_directory_unreadable")
+        } else null)
+            ?.asSequence()
+            ?.filter { directory ->
+                directory.isDirectory && File(directory, "config_v2.json").isFile
+            }
+            ?.map { directory -> directory.name }
+            ?.toList()
+            .orEmpty()
 
     @JvmStatic
     fun getDefaultConfigV2File(): File {
@@ -208,14 +335,11 @@ object Files {
     }
 
     @JvmStatic
-    fun getFriendWatchFile(userId: String): File? {
-        return getTargetFileofUser(userId, "friendWatch.json")
-    }
-
-    @JvmStatic
     fun exportFile(file: File, hasTime: Boolean): File? {
         val exportFile = createExportTargetFile(file, hasTime) ?: return null
-        val sensitiveKeywords = collectLogSensitiveKeywords()
+        val sensitiveKeywords = if (LogCatalog.findByFileName(file.name)?.techKind == LogTechKind.CAPTURE) {
+            emptyList()
+        } else collectLogSensitiveKeywords()
         if (sensitiveKeywords.isEmpty()) {
             if (!copy(file, exportFile)) {
                 Log.error(TAG, "Failed to copy file: ${file.absolutePath} to ${exportFile.absolutePath}")
@@ -290,7 +414,38 @@ object Files {
         }
     }
 
-    private fun maskSensitiveText(text: String, sensitiveKeywords: List<String>): String {
+    internal fun maskSensitiveText(text: String, sensitiveKeywords: List<String>): String {
+        val capture = if (text.firstOrNull() == '{') {
+            runCatching { JSONObject(text) }.getOrNull()
+        } else null
+        if (capture?.optString("schema") == "rpc-capture") {
+            fun maskValue(value: Any?): Any? = when (value) {
+                is JSONObject -> {
+                    // 编码字节不属于文本，替换其中的字符会破坏字节长度与流偏移。
+                    if (value.optString("encoding") == "base64" &&
+                        value.opt("size") is Number && value.opt("data") is String
+                    ) {
+                        value
+                    } else {
+                        val keys = value.keys()
+                        while (keys.hasNext()) {
+                            val key = keys.next()
+                            value.put(key, maskValue(value.opt(key)))
+                        }
+                        value
+                    }
+                }
+                is JSONArray -> {
+                    for (index in 0 until value.length()) {
+                        value.put(index, maskValue(value.opt(index)))
+                    }
+                    value
+                }
+                is String -> sensitiveKeywords.fold(value) { result, keyword -> result.replace(keyword, "***") }
+                else -> value
+            }
+            return maskValue(capture).toString()
+        }
         var sanitized = text
         sensitiveKeywords.forEach { keyword ->
             sanitized = sanitized.replace(keyword, "***")
@@ -298,7 +453,7 @@ object Files {
         return sanitized
     }
 
-    private fun collectLogSensitiveKeywords(): List<String> {
+    internal fun collectLogSensitiveKeywords(): List<String> {
         val keywords = linkedSetOf<String>()
         CONFIG_DIR.listFiles()?.filter { it.isDirectory }?.forEach { userDir ->
             collectKeywordsFromSelfFile(File(userDir, "self.json"), keywords)
@@ -416,25 +571,10 @@ object Files {
     }
 
     @JvmStatic
-    fun getLogFile(channel: LogChannel): File = ensureLogFile(channel.fileName)
-
-    @JvmStatic
-    fun getLogFileByLoggerName(loggerName: String?): File? {
-        val channel = LogCatalog.findByLoggerName(loggerName) ?: return null
-        return getLogFile(channel)
-    }
-
-    @JvmStatic
-    fun getVisibleLogChannels(): List<LogChannel> = LogCatalog.visibleChannels()
-
-    @JvmStatic
-    fun close(c: Closeable?) {
-        try {
-            c?.close()
-        } catch (e: IOException) {
-            Log.printStackTrace(TAG, e)
-        }
-    }
+    fun getLogFile(channel: LogChannel): File =
+        if (channel == LogChannel.SYSTEM) {
+            checkNotNull(Logback.systemLogFile) { "System diagnostics not initialized" }
+        } else ensureLogFile(channel.fileName)
 
     @JvmStatic
     fun readFromFile(f: File): String {
@@ -452,8 +592,7 @@ object Files {
         }
     }
 
-    @JvmStatic
-    fun beforWrite(f: File): Boolean {
+    private fun beforeWrite(f: File): Boolean {
         if (f.exists()) {
             if (!f.canWrite()) {
                 ToastUtil.showToast("${f.absoluteFile}没有写入权限！")
@@ -478,7 +617,7 @@ object Files {
     @JvmStatic
     @Synchronized
     fun write2File(s: String, f: File): Boolean {
-        if (beforWrite(f)) return false
+        if (beforeWrite(f)) return false
         var fw: FileWriter? = null
         try {
             fw = FileWriter(f, false)
@@ -499,8 +638,7 @@ object Files {
         }
     }
 
-    @JvmStatic
-    fun copy(source: File, dest: File): Boolean {
+    private fun copy(source: File, dest: File): Boolean {
         // Kotlin 扩展方法，内部使用了 FileChannel 或 Files.copy
         return try {
             createFile(dest)?.let { target ->
@@ -513,23 +651,7 @@ object Files {
         }
     }
 
-    @JvmStatic
-    fun streamTo(source: InputStream, dest: OutputStream): Boolean {
-        return try {
-            source.use { input ->
-                dest.use { output ->
-                    input.copyTo(output)
-                }
-            }
-            true
-        } catch (e: IOException) {
-            Log.printStackTrace(e)
-            false
-        }
-    }
-
-    @JvmStatic
-    fun createFile(file: File): File? {
+    private fun createFile(file: File): File? {
         if (file.exists() && file.isDirectory) {
             if (!file.delete()) return null
         }
@@ -583,6 +705,52 @@ object Files {
         return allSuccess && deleteFileWithRetry(file)
     }
 
+    /**
+     * 清理模块自有的全部持久化文件，但保留静态目录对象及其根目录本身。
+     * 用户主动导出的备份位于 Downloads，不属于这里的模块存储范围。
+     */
+    @JvmStatic
+    @Synchronized
+    fun clearAllModuleData(context: Context): ClearAllResult {
+        val failedPaths = linkedSetOf<String>()
+        val targets = linkedSetOf<File>()
+
+        targets += MAIN_DIR
+        context.getExternalFilesDir("logs")?.let { targets += it }
+        targets += File(context.filesDir, "logs")
+
+        targets.forEach { directory ->
+            clearDirectoryContents(directory, failedPaths)
+        }
+
+        ensureDir(MAIN_DIR)
+        ensureDir(CONFIG_DIR)
+        ensureDir(LOG_DIR)
+
+        return ClearAllResult(failedPaths.toList())
+    }
+
+    private fun clearDirectoryContents(directory: File, failedPaths: MutableSet<String>) {
+        if (!directory.exists()) return
+        if (!directory.isDirectory) {
+            if (!deleteFileWithRetry(directory)) {
+                failedPaths += directory.absolutePath
+            }
+            return
+        }
+
+        val children = directory.listFiles()
+        if (children == null) {
+            failedPaths += directory.absolutePath
+            return
+        }
+        children.forEach { child ->
+            if (!delFile(child)) {
+                failedPaths += child.absolutePath
+            }
+        }
+    }
+
     private fun deleteFileWithRetry(file: File): Boolean {
         var retryCount = 3
         while (retryCount > 0) {
@@ -590,8 +758,10 @@ object Files {
                 return true
             }
             retryCount--
-            Log.record(TAG, "删除失败，重试中: ${file.absolutePath}")
-            CoroutineUtils.sleepCompat(500)
+            if (retryCount > 0) {
+                Log.record(TAG, "删除失败，重试中: ${file.absolutePath}")
+                CoroutineUtils.sleepCompat(500)
+            }
         }
         Log.error(TAG, "删除失败: ${file.absolutePath}")
         return false

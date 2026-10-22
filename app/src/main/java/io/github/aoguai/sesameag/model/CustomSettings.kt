@@ -1,28 +1,16 @@
 package io.github.aoguai.sesameag.model
 
-import android.app.TimePickerDialog
-import android.content.Context
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
-import androidx.appcompat.app.AlertDialog
-import io.github.aoguai.sesameag.R
 import io.github.aoguai.sesameag.data.Status
 import io.github.aoguai.sesameag.data.StatusFlags
 import io.github.aoguai.sesameag.entity.MapperEntity
 import io.github.aoguai.sesameag.model.modelFieldExt.BooleanModelField
 import io.github.aoguai.sesameag.model.modelFieldExt.SelectModelField
 import io.github.aoguai.sesameag.model.modelFieldExt.TimeWindowListModelField
-import io.github.aoguai.sesameag.ui.widget.ListDialog
-import io.github.aoguai.sesameag.util.SesameAgUtil
 import io.github.aoguai.sesameag.util.Files
 import io.github.aoguai.sesameag.util.JsonUtil
 import io.github.aoguai.sesameag.util.Log
-import io.github.aoguai.sesameag.util.TimeUtil
-import io.github.aoguai.sesameag.util.ToastUtil
 import io.github.aoguai.sesameag.util.maps.UserMap
-import java.lang.reflect.Field
+import java.util.LinkedHashSet
 
 /**
  * 自定义设置管理类
@@ -51,12 +39,13 @@ object CustomSettings {
     private fun getModuleList(): List<MapperEntity> {
         return listOf(
             SimpleEntity("antForest", "蚂蚁森林"),
+            SimpleEntity("antForestPatrol", "保护地巡护"),
             SimpleEntity("antFarm", "蚂蚁庄园"),
             SimpleEntity("antOcean", "海洋"),
             SimpleEntity("antOrchard", "农场"),
+            SimpleEntity("goldenBeanTreasure", "金豆夺宝"),
             SimpleEntity("antStall", "新村"),
             SimpleEntity("antDodo", "神奇物种"),
-            SimpleEntity("antFishPond", "福气鱼池"),
             SimpleEntity("antCooperate", "蚂蚁森林合种"),
             SimpleEntity("antSports", "运动"),
             SimpleEntity("antMember", "会员"),
@@ -64,32 +53,34 @@ object CustomSettings {
             SimpleEntity("antSesameCredit", "芝麻信用"),
             SimpleEntity("EcoProtection", "生态保护"),
             SimpleEntity("greenFinance", "绿色经营"),
-            SimpleEntity("reserve", "保护地"),
-            SimpleEntity("other", "其他任务")
+            SimpleEntity("reserve", "保护地")
         )
     }
 
-    private fun getUserDisplayNameList(): Pair<List<String>, List<String>> {
-        val uids = SesameAgUtil.getFolderList(Files.CONFIG_DIR.absolutePath)
-        val displayNames = mutableListOf<String>()
-        val validUids = mutableListOf<String>()
-        val backupUid = UserMap.currentUid
-        uids.forEach { uid ->
-            try {
-                UserMap.loadSelf(uid)
-                val user = UserMap.get(uid)
-                displayNames.add(user?.showName ?: uid)
-                validUids.add(uid)
-            } catch (e: Exception) {
-                displayNames.add(uid)
-                validUids.add(uid)
+    fun normalizeForImport(data: Map<*, *>): LinkedHashMap<String, Any?> {
+        val normalized = linkedMapOf<String, Any?>()
+        data.forEach { (key, value) ->
+            require(key is String) { "自定义设置字段名无效" }
+            normalized[key] = value
+        }
+        listOf(onlyOnceDaily, autoHandleOnceDaily).forEach { field ->
+            val value = data[field.code]
+            require(value == null || value is Boolean) { "自定义设置 ${field.code} 需要布尔值" }
+        }
+        data[onlyOnceDailyList.code]?.let { value ->
+            require(value is Collection<*> && value.all { it == null || it is String }) {
+                "自定义设置 ${onlyOnceDailyList.code} 需要模块列表"
             }
+            val field = SelectModelField(onlyOnceDailyList.code, onlyOnceDailyList.name, LinkedHashSet<String?>(), getModuleList())
+            field.setObjectValue(value)
+            normalized[field.code] = field.value
         }
-        if (!backupUid.isNullOrEmpty()) {
-            UserMap.setCurrentUserId(backupUid)
-            UserMap.loadSelf(backupUid)
+        data[autoHandleOnceDailyTimes.code]?.let { value ->
+            require(value is String) { "自定义设置 ${autoHandleOnceDailyTimes.code} 需要时间段字符串" }
+            val field = TimeWindowListModelField(autoHandleOnceDailyTimes.code, autoHandleOnceDailyTimes.name, value, allowDisable = true)
+            normalized[field.code] = field.value
         }
-        return Pair(displayNames, validUids)
+        return normalized
     }
 
     private fun resetToDefault() {
@@ -101,37 +92,42 @@ object CustomSettings {
 
     @JvmStatic
     fun save(userId: String) {
-        if (userId.isEmpty()) return
-        try {
-            val file = Files.getCustomSetFile(userId) ?: return
-            val data = mutableMapOf<String, Any?>()
-            data[onlyOnceDaily.code] = onlyOnceDaily.value
-            data[onlyOnceDailyList.code] = onlyOnceDailyList.value
-            data[autoHandleOnceDaily.code] = autoHandleOnceDaily.value
-            data[autoHandleOnceDailyTimes.code] = autoHandleOnceDailyTimes.value
-            val json = JsonUtil.formatJson(data)
-            Files.write2File(json, file)
+        trySave(userId)
+    }
+
+    fun trySave(userId: String): Boolean {
+        if (userId.isEmpty()) return false
+        return try {
+            Files.withAccountLock(userId) {
+                val file = requireNotNull(Files.getCustomSetFile(userId))
+                val data = mutableMapOf<String, Any?>()
+                data[onlyOnceDaily.code] = onlyOnceDaily.value
+                data[onlyOnceDailyList.code] = onlyOnceDailyList.value
+                data[autoHandleOnceDaily.code] = autoHandleOnceDaily.value
+                data[autoHandleOnceDailyTimes.code] = autoHandleOnceDailyTimes.value
+                Files.writeAtomically(JsonUtil.formatJson(data), file)
+            }
         } catch (e: Throwable) {
             Log.printStackTrace(TAG, "Failed to save custom settings", e)
+            false
         }
     }
 
     @JvmStatic
     fun load(userId: String) {
         if (userId.isEmpty()) return
-        resetToDefault()
         try {
-            val file = Files.getCustomSetFile(userId) ?: return
-            if (!file.exists()) {
-                return
+            Files.withAccountLock(userId) {
+                val file = requireNotNull(Files.getCustomSetFile(userId))
+                val json = file.readText(Charsets.UTF_8)
+                val data = if (json.isBlank()) emptyMap<String, Any?>()
+                    else normalizeForImport(JsonUtil.copyMapper().readValue(json, Map::class.java))
+                resetToDefault()
+                applyLoadedValues(data)
             }
-            val json = Files.readFromFile(file)
-            if (json.isBlank()) {
-                return
-            }
-            val data = JsonUtil.copyMapper().readValue(json, Map::class.java)
-            applyLoadedValues(data)
         } catch (e: Throwable) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            resetToDefault()
             Log.printStackTrace(TAG, "Failed to load custom settings, keeping defaults", e)
             Log.runtime(TAG, "自定义设置加载失败，已回退默认值:userId=$userId")
             Log.record(TAG, "自定义设置加载失败，已回退默认值:userId=$userId")
@@ -161,14 +157,15 @@ object CustomSettings {
     fun getModuleId(taskInfo: String?): String? {
         if (taskInfo == null) return null
         return when {
+            taskInfo == "保护地巡护" || taskInfo == "antForestPatrol" || taskInfo == "AntForestPatrol" -> "antForestPatrol"
             taskInfo.contains("合种") || taskInfo.contains("antCooperate") -> "antCooperate"
             taskInfo.contains("蚂蚁森林") || taskInfo.contains("antForest") -> "antForest"
             taskInfo.contains("蚂蚁庄园") || taskInfo.contains("antFarm") -> "antFarm"
             taskInfo.contains("海洋") || taskInfo.contains("antOcean") -> "antOcean"
             taskInfo.contains("农场") || taskInfo.contains("antOrchard") -> "antOrchard"
+            taskInfo == "金豆夺宝" || taskInfo == "goldenBeanTreasure" -> "goldenBeanTreasure"
             taskInfo.contains("新村") || taskInfo.contains("antStall") -> "antStall"
             taskInfo.contains("神奇物种") || taskInfo.contains("antDodo") -> "antDodo"
-            taskInfo.contains("福气鱼池") || taskInfo.contains("antFishPond") -> "antFishPond"
             taskInfo.contains("运动") || taskInfo.contains("antSports") -> "antSports"
             taskInfo.contains("芝麻信用") || taskInfo.contains("antSesameCredit") -> "antSesameCredit"
             taskInfo.contains("会员") || taskInfo.contains("antMember") -> "antMember"
@@ -176,7 +173,6 @@ object CustomSettings {
             taskInfo.contains("生态保护") || taskInfo.contains("EcoProtection") -> "EcoProtection"
             taskInfo.contains("绿色经营") || taskInfo.contains("greenFinance") -> "greenFinance"
             taskInfo.contains("保护地") || taskInfo.contains("reserve") -> "reserve"
-            taskInfo.contains("其他任务") || taskInfo.contains("other") -> "other"
             else -> null
         }
     }
@@ -230,211 +226,6 @@ object CustomSettings {
         return OnceDailyStatus(isEnabled, isFinished)
     }
 
-
-    @JvmStatic
-    fun showSingleRunMenu(context: Context, onRefresh: () -> Unit) {
-        val (displayNames, userIds) = getUserDisplayNameList()
-        if (userIds.isEmpty()) {
-            ToastUtil.showToast(context, "未发现任何用户配置")
-            return
-        }
-        AlertDialog.Builder(context)
-            .setTitle("请选择操作目标账号")
-            .setItems(displayNames.toTypedArray()) { _, which ->
-                val selectedUid = userIds[which]
-                val selectedShowName = displayNames[which]
-                load(selectedUid)
-                showAccountOps(context, selectedUid, selectedShowName, onRefresh)
-            }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
-    }
-
-    private data class TimeWindowRow(
-        var start: String,
-        var end: String
-    )
-
-    private fun parseTimeWindowRows(configValue: String?): MutableList<TimeWindowRow> {
-        val rows = mutableListOf<TimeWindowRow>()
-        configValue.orEmpty()
-            .split(",")
-            .map { it.trim() }
-            .filter { it.contains("-") }
-            .forEach { token ->
-                val parts = token.split("-", limit = 2)
-                if (parts.size == 2) {
-                    rows += TimeWindowRow(parts[0], parts[1])
-                }
-            }
-        if (rows.isEmpty()) {
-            rows += TimeWindowRow("0600", "0650")
-        }
-        return rows
-    }
-
-    private fun formatTimeToken(timeToken: String): String {
-        val normalized = timeToken.filter { it.isDigit() }.padStart(4, '0')
-        return "${normalized.substring(0, 2)}:${normalized.substring(2, 4)}"
-    }
-
-    private fun pickTimeToken(context: Context, initialToken: String, onPicked: (String) -> Unit) {
-        val initialCalendar = TimeUtil.getTodayCalendarByTimeStr(initialToken)
-            ?: TimeUtil.getTodayCalendarByTimeStr("0000")
-            ?: return
-        TimePickerDialog(
-            context,
-            { _, hourOfDay, minute ->
-                onPicked(String.format("%02d%02d", hourOfDay, minute))
-            },
-            initialCalendar.get(java.util.Calendar.HOUR_OF_DAY),
-            initialCalendar.get(java.util.Calendar.MINUTE),
-            true
-        ).show()
-    }
-
-    private fun showAutoHandleTimeWindowDialog(
-        context: Context,
-        uid: String,
-        showName: String,
-        onRefresh: () -> Unit
-    ) {
-        val rows = parseTimeWindowRows(autoHandleOnceDailyTimes.getConfigValue())
-        val container = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(24, 24, 24, 24)
-        }
-        val scrollView = ScrollView(context).apply {
-            addView(container)
-        }
-
-        fun renderRows() {
-            container.removeAllViews()
-
-            rows.forEachIndexed { index, row ->
-                val rowLayout = LinearLayout(context).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                }
-                val startButton = Button(context).apply {
-                    text = formatTimeToken(row.start)
-                    setOnClickListener {
-                        pickTimeToken(context, row.start) { picked ->
-                            row.start = picked
-                            renderRows()
-                        }
-                    }
-                }
-                val separator = TextView(context).apply {
-                    text = "  至  "
-                }
-                val endButton = Button(context).apply {
-                    text = formatTimeToken(row.end)
-                    setOnClickListener {
-                        pickTimeToken(context, row.end) { picked ->
-                            row.end = picked
-                            renderRows()
-                        }
-                    }
-                }
-                val removeButton = Button(context).apply {
-                    text = "删除"
-                    isEnabled = rows.size > 1
-                    setOnClickListener {
-                        if (rows.size > 1) {
-                            rows.removeAt(index)
-                            renderRows()
-                        }
-                    }
-                }
-                rowLayout.addView(startButton)
-                rowLayout.addView(separator)
-                rowLayout.addView(endButton)
-                rowLayout.addView(removeButton)
-                container.addView(rowLayout)
-            }
-
-            container.addView(Button(context).apply {
-                text = "新增时间段"
-                setOnClickListener {
-                    rows += TimeWindowRow("0000", "0030")
-                    renderRows()
-                }
-            })
-
-            container.addView(TextView(context).apply {
-                text = "时间段采用开始包含、结束不包含；自动全量模式开启后，命中这些时间段时会临时放开单次运行限制。"
-            })
-        }
-
-        renderRows()
-
-        AlertDialog.Builder(context)
-            .setTitle("设置 ${showName} 非单次运行时段")
-            .setView(scrollView)
-            .setPositiveButton(R.string.ok) { _, _ ->
-                val serialized = rows
-                    .map { "${it.start}-${it.end}" }
-                    .joinToString(",")
-                if (serialized.isBlank()) {
-                    autoHandleOnceDailyTimes.reset()
-                } else {
-                    autoHandleOnceDailyTimes.setConfigValue(serialized)
-                }
-                save(uid)
-                onRefresh()
-                showAccountOps(context, uid, showName, onRefresh)
-            }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
-    }
-
-    private fun showAccountOps(context: Context, uid: String, showName: String, onRefresh: () -> Unit) {
-        val isFinished = try {
-            Status.hasFlagToday(StatusFlags.FLAG_ONCE_DAILY_FINISHED)
-        } catch (e: Throwable) {
-            false
-        }
-        val statusText = when {
-            onlyOnceDaily.value != true -> "单次运行：已关闭"
-            autoHandleOnceDaily.value == true -> "单次运行：自动模式"
-            isFinished -> "单次运行：今日已完成"
-            else -> "单次运行：已开启"
-        }
-        val ops = arrayOf(statusText, "设置单次运行跳过模块", "设置非单次运行的时段")
-        AlertDialog.Builder(context)
-            .setTitle("账号：$showName")
-            .setItems(ops) { _, which ->
-                if (which == 0) {
-                    val currentOnlyOnce = onlyOnceDaily.value == true
-                    val currentAuto = autoHandleOnceDaily.value == true
-                    if (!currentOnlyOnce) {
-                        onlyOnceDaily.value = true
-                        autoHandleOnceDaily.value = false
-                    } else if (!currentAuto) {
-                        autoHandleOnceDaily.value = true
-                    } else {
-                        onlyOnceDaily.value = false
-                        autoHandleOnceDaily.value = false
-                    }
-                    save(uid)
-                    onRefresh()
-                    showAccountOps(context, uid, showName, onRefresh)
-                } else if (which == 1) {
-                    ListDialog.show(context, "单次运行跳过模块 | $showName", onlyOnceDailyList)
-                    try {
-                        val dialogField: Field = ListDialog::class.java.getDeclaredField("listDialog")
-                        dialogField.isAccessible = true
-                        val dialog = dialogField.get(null) as? androidx.appcompat.app.AlertDialog
-                        dialog?.setOnDismissListener { save(uid) }
-                    } catch (e: Exception) {
-                    }
-                } else if (which == 2) {
-                    showAutoHandleTimeWindowDialog(context, uid, showName, onRefresh)
-                }
-            }
-            .setNegativeButton("返回", null)
-            .show()
-    }
 }
 
 private class SimpleEntity(id: String, name: String) : MapperEntity() {

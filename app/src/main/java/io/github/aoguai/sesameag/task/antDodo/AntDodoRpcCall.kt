@@ -12,7 +12,6 @@ object AntDodoRpcCall {
     private const val METHOD_QUERY_ANIMAL_STATUS = "alipay.antdodo.rpc.h5.queryAnimalStatus"
     private const val METHOD_HOME_PAGE = "alipay.antdodo.rpc.h5.homePage"
     private const val METHOD_COLLECT = "alipay.antdodo.rpc.h5.collect"
-    private const val METHOD_TASK_ENTRANCE = "alipay.antdodo.rpc.h5.taskEntrance"
     private const val METHOD_TASK_LIST = "alipay.antdodo.rpc.h5.taskList"
     private const val METHOD_PROP_LIST = "alipay.antdodo.rpc.h5.propList"
     private const val METHOD_CONSUME_PROP = "alipay.antdodo.rpc.h5.consumeProp"
@@ -45,22 +44,20 @@ object AntDodoRpcCall {
     }
 
     /**
-     * 任务入口
-     */
-    @JvmStatic
-    fun taskEntrance(): String {
-        return RequestManager.requestString(
-            METHOD_TASK_ENTRANCE,
-            "[{\"statusList\":[\"TODO\",\"FINISHED\"]}]"
-        )
-    }
-
-    /**
      * 收集
      */
     @JvmStatic
     fun collect(): String {
         return RequestManager.requestString(METHOD_COLLECT, "[{}]")
+    }
+
+    @JvmStatic
+    fun scratchCard(animalId: String, bookId: String, cardInstanceId: String): String {
+        val args = JSONObject()
+            .put("animalId", animalId)
+            .put("bookId", bookId)
+            .put("cardInstanceId", cardInstanceId)
+        return RequestManager.requestString("alipay.antdodo.rpc.h5.scratchCard", "[$args]")
     }
 
     /**
@@ -88,14 +85,6 @@ object AntDodoRpcCall {
                     + taskType + "\",\"uniqueId\":\"" + uniqueId + "\"}]")
         )
         return response
-    }
-
-    @JvmStatic
-    fun clickGame(appId: String?): String {
-        return RequestManager.requestString(
-            "com.alipay.charitygamecenter.clickGame",
-            ("[{\"appId\":\"" + appId + "\",\"bizType\":\"ANTFOREST\",\"requestType\":\"RPC\",\"sceneCode\":\"ANTFOREST\",\"source\":\"ANTFOREST\"}]")
-        )
     }
 
     /**

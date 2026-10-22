@@ -14,7 +14,6 @@ import io.github.aoguai.sesameag.util.ToastUtil
 class SesameApplication : Application() {
 
     companion object {
-        private const val TAG = "SesameApplication"
         const val PREFERENCES_KEY = "sesame-ag"
         var hasPermissions: Boolean = false
         @JvmStatic
@@ -27,6 +26,7 @@ class SesameApplication : Application() {
         appContext = applicationContext
         ToastUtil.init(this)
         Log.init(this)
+        io.github.aoguai.sesameag.util.ModuleDiagnostics.event("application", "created")
         ThemeManager.init(this)
     }
 }

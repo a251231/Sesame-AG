@@ -8,8 +8,6 @@ import org.json.JSONObject
 
 /**
  * 神奇海洋 RPC调用
- * @author Constanline
- * @since 2023/08/01
  */
 object AntOceanRpcCall {
     private const val VERSION = "20241203"
@@ -20,6 +18,7 @@ object AntOceanRpcCall {
     private const val SOURCE_AI_FISH = "ANT_OCEAN"
     private const val SOURCE_FOREST = "ANT_FOREST"
     private const val SOURCE_OCEAN = "ANTFOCEAN"
+    private const val SOURCE_TASK_FINISH_H5 = "ANTOCEAN"
     private const val SOURCE_REPLICA = "senlinzuoshangjiao"
     private const val SOURCE_SEA_AREA_LIST = "seaAreaList"
     
@@ -59,6 +58,14 @@ object AntOceanRpcCall {
             "${taskType}_${RandomUtil.nextDouble()}"
         }
     }
+
+    private fun buildGameFinishTaskPayload(sceneCode: String, taskType: String): JSONObject =
+        JSONObject()
+            .put("outBizNo", buildTaskOutBizNo(taskType))
+            .put("requestType", "H5")
+            .put("sceneCode", sceneCode)
+            .put("source", SOURCE_TASK_FINISH_H5)
+            .put("taskType", taskType)
     
     @JvmStatic
     fun queryOceanStatus(): String {
@@ -69,10 +76,14 @@ object AntOceanRpcCall {
     }
     
     @JvmStatic
-    fun queryHomePage(showTaskPanel: Boolean = false): String {
+    fun queryHomePage(
+        showTaskPanel: Boolean = false,
+        source: String = SOURCE_APP_CENTER,
+        firstTaskType: String? = null,
+    ): String {
         val payload = StringBuilder()
             .append("[{\"source\":\"")
-            .append(SOURCE_APP_CENTER)
+            .append(source)
             .append("\",\"uniqueId\":\"")
             .append(getUniqueId())
             .append("\",\"version\":\"")
@@ -80,6 +91,9 @@ object AntOceanRpcCall {
             .append("\"")
         if (showTaskPanel) {
             payload.append(",\"showTaskPanel\":\"yes\"")
+        }
+        if (!firstTaskType.isNullOrBlank()) {
+            payload.append(",\"firstTaskType\":").append(JSONObject.quote(firstTaskType))
         }
         payload.append("}]")
         return RequestManager.requestString(
@@ -127,6 +141,32 @@ object AntOceanRpcCall {
             "[{\"source\":\"$SOURCE_AI_FISH\",\"uniqueId\":\"${getUniqueId()}\"}]"
         )
     }
+
+    @JvmStatic
+    fun queryAiFishProject(): String = RequestManager.requestString(
+        "alipay.antaifish.h5.queryProjectDetail",
+        "[{\"source\":\"$SOURCE_AI_FISH\",\"uniqueId\":\"${getUniqueId()}\"}]"
+    )
+
+    @JvmStatic
+    fun exchangeAiFishProject(): String = RequestManager.requestString(
+        "alipay.antaifish.h5.exchangeProject",
+        "[{\"source\":\"$SOURCE_AI_FISH\",\"uniqueId\":\"${getUniqueId()}\"}]"
+    )
+
+    @JvmStatic
+    fun queryNeedAppraiseFishList(): String = RequestManager.requestString(
+        "alipay.antaifish.h5.queryNeedAppraiseFishList",
+        JSONArray().put(JSONObject().put("source", SOURCE_AI_FISH).put("uniqueId", getUniqueId())).toString(),
+    )
+
+    @JvmStatic
+    fun fishAppraise(fish: JSONObject): String = RequestManager.requestString(
+        "alipay.antaifish.h5.fishAppraise",
+        JSONArray().put(JSONObject().put("appraiseType", "LIKE").put("imageId", fish.getString("imageId"))
+            .put("seasonId", fish.getString("seasonId")).put("targetUserId", fish.getString("userId"))
+            .put("source", SOURCE_AI_FISH).put("uniqueId", getUniqueId())).toString(),
+    )
 
     @JvmStatic
     fun aiFishListTask(): String {
@@ -177,10 +217,12 @@ object AntOceanRpcCall {
     }
     
     @JvmStatic
-    fun receiveTaskAward(sceneCode: String, taskType: String): String {
+    fun receiveTaskAward(sceneCode: String, taskType: String, source: String = SOURCE_OCEAN): String {
         return RequestManager.requestString(
             "com.alipay.antiep.receiveTaskAward",
-            "[{\"ignoreLimit\":false,\"requestType\":\"RPC\",\"sceneCode\":\"$sceneCode\",\"source\":\"$SOURCE_OCEAN\",\"taskType\":\"$taskType\",\"uniqueId\":\"${getUniqueId()}\"}]"
+            JSONArray().put(JSONObject().put("ignoreLimit", false).put("requestType", "RPC")
+                .put("sceneCode", sceneCode).put("source", source).put("taskType", taskType)
+                .put("uniqueId", getUniqueId())).toString()
         )
     }
     
@@ -189,6 +231,15 @@ object AntOceanRpcCall {
         return RequestManager.requestString(
             "com.alipay.antiep.finishTask",
             "[${buildFinishTaskPayload(sceneCode, taskType)}]"
+        )
+    }
+
+    /** Captured H5 completion contract for game tasks returned by ANTOCEAN_TASK. */
+    @JvmStatic
+    fun finishGameTask(sceneCode: String, taskType: String): String {
+        return RequestManager.requestString(
+            "com.alipay.antiep.finishTask",
+            "[${buildGameFinishTaskPayload(sceneCode, taskType)}]"
         )
     }
     
@@ -369,7 +420,6 @@ object AntOceanRpcCall {
         userId: String,
         fromAct: String? = null,
         interactFlags: String = "",
-        currentUserId: String? = null
     ): String {
         val payload = JSONObject().apply {
             put("friendUserId", userId)
@@ -380,9 +430,7 @@ object AntOceanRpcCall {
             if (!fromAct.isNullOrBlank()) {
                 put("fromAct", fromAct)
             }
-            if (!currentUserId.isNullOrBlank()) {
-                put("userId", currentUserId)
-            }
+            put("userId", userId)
         }
         return RequestManager.requestString(
             "alipay.antocean.ocean.h5.queryFriendPage",
@@ -463,9 +511,16 @@ object AntOceanRpcCall {
     
     @JvmStatic
     fun submitAnswer(answer: String, questionId: String): String {
+        val args = JSONObject()
+            .put("activityId", "363")
+            .put("answer", answer)
+            .put("dadaVersion", "1.3.0")
+            .put("outBizId", "ANTOCEAN_DATI_PINTU_722_new")
+            .put("questionId", questionId)
+            .put("version", "1")
         return RequestManager.requestString(
             "com.alipay.reading.game.dada.openDailyAnswer.submitAnswer",
-            "[{\"activityId\":\"363\",\"answer\":\"$answer\",\"dadaVersion\":\"1.3.0\",\"outBizId\":\"ANTOCEAN_DATI_PINTU_722_new\",\"questionId\":\"$questionId\",\"version\":\"1\"}]"
+            JSONArray().put(args).toString()
         )
     }
     
@@ -480,10 +535,14 @@ object AntOceanRpcCall {
     }
     
     @JvmStatic
-    fun queryTaskList(): String {
+    fun queryTaskList(source: String = SOURCE_APP_CENTER, firstTaskType: String? = null): String {
+        val extend = JSONObject().put("taskEntranceSubscript", true)
+        if (!firstTaskType.isNullOrBlank()) extend.put("firstTaskType", firstTaskType)
         return RequestManager.requestString(
             "alipay.antocean.ocean.h5.queryTaskList",
-            "[{\"extend\":{\"taskEntranceSubscript\":true},\"fromAct\":\"dynamic_task\",\"sceneCode\":\"ANTOCEAN_TASK\",\"source\":\"$SOURCE_APP_CENTER\",\"uniqueId\":\"${getUniqueId()}\",\"version\":\"$VERSION\"}]"
+            JSONArray().put(JSONObject().put("extend", extend).put("fromAct", "dynamic_task")
+                .put("sceneCode", "ANTOCEAN_TASK").put("source", source).put("uniqueId", getUniqueId())
+                .put("version", VERSION)).toString()
         )
     }
     
@@ -524,14 +583,6 @@ object AntOceanRpcCall {
     @JvmStatic
     fun usePropByTypeList(): String {
         return queryOceanPropList()
-    }
-    
-    @JvmStatic
-    fun queryFishList(pageNum: Int): String {
-        return RequestManager.requestString(
-            "alipay.antocean.ocean.h5.queryFishList",
-            "[{\"combineStatus\":\"UNOBTAINED\",\"needSummary\":\"Y\",\"pageNum\":$pageNum,\"source\":\"$SOURCE_FOREST\",\"targetUserId\":\"\",\"uniqueId\":\"${getUniqueId()}\"}]"
-        )
     }
     
     @JvmStatic

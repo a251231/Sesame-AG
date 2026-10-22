@@ -7,22 +7,32 @@ object RpcOfflineRisk {
     private const val TAG = "风控"
     private val directRiskCodes = setOf("1009")
     private val offlineModeCodes = setOf("I07")
-    private val adTrafficRiskCodes = setOf("217", "61002")
+    private const val XLIGHT_TRAFFIC_RESTRICTION_CODE = "217"
+    private const val XLIGHT_TRAFFIC_RESTRICTION_SSP_CODE = "61002"
 
-    private val riskKeywords = listOf(
-        "需要验证",
-        "需要驗證",
-        "進行驗證",
-        "进行验证",
-        "保障你的正常存取",
-        "保障你的正常访问",
-        "访问受限",
-        "訪問受限",
-        "访问被拒绝",
-        "訪問被拒絕",
-        "访问异常",
-        "訪問異常"
-    )
+    private val verificationKeywords =
+        listOf(
+            "需要验证", "需要驗證", "進行驗證", "进行验证",
+            "保障你的正常存取", "保障你的正常访问",
+        )
+
+    private val recoverableVerificationKeywords = verificationKeywords +
+        listOf("滑块", "滑塊", "验证码", "驗證碼", "captcha")
+
+    private val hardBlockKeywords =
+        listOf("访问受限", "訪問受限", "访问被拒绝", "訪問被拒絕")
+
+    private val riskKeywords = verificationKeywords + hardBlockKeywords + listOf("访问异常", "訪問異常")
+
+    /** 只用于本次真实响应；I07 的历史源错误不能归因到当前 RPC。 */
+    fun isHardBlocked(jsonObject: JSONObject): Boolean {
+        val code = extractCode(jsonObject).trim()
+        val message = extractMessage(jsonObject)
+        if (recoverableVerificationKeywords.any { message.contains(it, ignoreCase = true) }) return false
+        if (code in offlineModeCodes || code == "2000" || message.contains("离线模式") || message.contains("登录超时")) return false
+        if (jsonObject.optBoolean("success", false) || jsonObject.optBoolean("isSuccess", false)) return false
+        return code in directRiskCodes || hardBlockKeywords.any { message.contains(it) }
+    }
 
     fun hasRiskKeyword(message: String): Boolean {
         if (message.isBlank()) {
@@ -31,7 +41,10 @@ object RpcOfflineRisk {
         return riskKeywords.any { keyword -> message.contains(keyword, ignoreCase = true) }
     }
 
-    fun isOfflineRisk(code: String, message: String): Boolean {
+    fun isOfflineRisk(
+        code: String,
+        message: String,
+    ): Boolean {
         val normalizedCode = code.trim()
         val normalizedMessage = message.trim()
         if (offlineModeCodes.contains(normalizedCode) || normalizedMessage.contains("离线模式")) {
@@ -49,20 +62,29 @@ object RpcOfflineRisk {
         if (isOfflineRisk(code, message)) {
             return true
         }
+        // RPC 触发全局离线后，任务层收到的是 I07 包装响应；真实风控码保存在源错误字段中。
+        val sourceCode = jsonObject.optString("offlineSourceCode")
+        val sourceMessage = jsonObject.optString("offlineSourceMessage")
+        if (sourceCode.isNotBlank() && isOfflineRisk(sourceCode, sourceMessage)) {
+            return true
+        }
         val stopObject = jsonObject.optJSONObject("_taskFlowStopObject")
         return stopObject != null && isOfflineRisk(stopObject)
     }
 
-    fun isAdTrafficRisk(jsonObject: JSONObject): Boolean {
-        if (!hasAdTrafficContext(jsonObject)) {
-            return false
-        }
-        val signalText = buildAdTrafficSignalText(jsonObject)
-        return adTrafficRiskCodes.any { code -> signalText.contains(code, ignoreCase = true) } ||
-            signalText.contains("cheating traffic", ignoreCase = true)
-    }
+    fun isAdTrafficRisk(jsonObject: JSONObject): Boolean =
+        sequenceOf(jsonObject, jsonObject.optJSONObject("resData"))
+            .filterNotNull()
+            .any { response ->
+                response.optString("retCode") == XLIGHT_TRAFFIC_RESTRICTION_CODE &&
+                    response.optString("sspErrorCode") == XLIGHT_TRAFFIC_RESTRICTION_SSP_CODE
+            }
 
-    fun enterOfflineIfNeeded(source: String, code: String, message: String): Boolean {
+    fun enterOfflineIfNeeded(
+        source: String,
+        code: String,
+        message: String,
+    ): Boolean {
         if (!isOfflineRisk(code, message)) {
             return false
         }
@@ -74,13 +96,16 @@ object RpcOfflineRisk {
             ApplicationHookConstants.enterOffline(
                 ApplicationHookConstants.getOfflineCooldownMs(),
                 "auth_like",
-                detail
+                detail,
             )
         }
         return true
     }
 
-    fun enterOfflineIfNeeded(source: String, jsonObject: JSONObject): Boolean {
+    fun enterOfflineIfNeeded(
+        source: String,
+        jsonObject: JSONObject,
+    ): Boolean {
         val code = extractCode(jsonObject)
         val message = extractMessage(jsonObject)
         if (enterOfflineIfNeeded(source, code, message)) {
@@ -90,8 +115,8 @@ object RpcOfflineRisk {
         return enterOfflineIfNeeded(source, stopObject)
     }
 
-    fun extractCode(jsonObject: JSONObject): String {
-        return sequenceOf(
+    fun extractCode(jsonObject: JSONObject): String =
+        sequenceOf(
             jsonObject.opt("resultCode")?.toString(),
             jsonObject.opt("errorCode")?.toString(),
             jsonObject.opt("error")?.toString(),
@@ -99,12 +124,11 @@ object RpcOfflineRisk {
             jsonObject.opt("code")?.toString(),
             jsonObject.opt("retCode")?.toString(),
             jsonObject.opt("sspErrorCode")?.toString(),
-            jsonObject.opt("errCode")?.toString()
+            jsonObject.opt("errCode")?.toString(),
         ).firstOrNull { !it.isNullOrBlank() }.orEmpty()
-    }
 
-    fun extractMessage(jsonObject: JSONObject): String {
-        return sequenceOf(
+    fun extractMessage(jsonObject: JSONObject): String =
+        sequenceOf(
             jsonObject.optString("resultDesc"),
             jsonObject.optString("resultView"),
             jsonObject.optString("memo"),
@@ -112,52 +136,16 @@ object RpcOfflineRisk {
             jsonObject.optString("errorMessage"),
             jsonObject.optString("errorMsg"),
             jsonObject.optString("sspErrorMsg"),
-            jsonObject.optString("message")
+            jsonObject.optString("message"),
         ).filter { it.isNotBlank() }
             .joinToString(" | ")
-    }
 
-    private fun hasAdTrafficContext(jsonObject: JSONObject): Boolean {
-        if (hasAdTrafficFields(jsonObject)) {
-            return true
-        }
-        val resData = jsonObject.optJSONObject("resData") ?: return false
-        return hasAdTrafficFields(resData)
-    }
-
-    private fun hasAdTrafficFields(jsonObject: JSONObject): Boolean {
-        return jsonObject.has("xlightRequestId") ||
-            jsonObject.has("sspErrorCode") ||
-            jsonObject.has("sspErrorMsg") ||
-            jsonObject.has("adList") ||
-            jsonObject.has("playingResult") ||
-            jsonObject.has("enableNewPlayingProto")
-    }
-
-    private fun buildAdTrafficSignalText(jsonObject: JSONObject): String {
-        return buildString {
-            appendAdTrafficSignals(jsonObject)
-            jsonObject.optJSONObject("resData")?.let { resData ->
-                append(' ')
-                appendAdTrafficSignals(resData)
-            }
-        }
-    }
-
-    private fun StringBuilder.appendAdTrafficSignals(jsonObject: JSONObject) {
-        append(extractCode(jsonObject))
-        append(' ')
-        append(extractMessage(jsonObject))
-        append(' ')
-        append(jsonObject.optString("retCode"))
-        append(' ')
-        append(jsonObject.optString("sspErrorCode"))
-        append(' ')
-        append(jsonObject.optString("sspErrorMsg"))
-    }
-
-    private fun buildDetail(source: String, code: String, message: String): String {
-        return buildString {
+    private fun buildDetail(
+        source: String,
+        code: String,
+        message: String,
+    ): String =
+        buildString {
             append(source)
             if (code.isNotBlank()) {
                 append(" code=")
@@ -168,5 +156,4 @@ object RpcOfflineRisk {
                 append(message.take(300))
             }
         }
-    }
 }

@@ -5,13 +5,9 @@ import io.github.aoguai.sesameag.util.RandomUtil
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
-import java.util.Random
 
 object AntCooperateRpcCall {
     private const val VERSION = "20230501"
-
-    // 使用 Random 保持与原 Java 逻辑一致
-    private val RANDOM: Random = Random()
 
     @JvmStatic
     fun queryUserCooperatePlantList(): String {
@@ -121,11 +117,7 @@ object AntCooperateRpcCall {
 
     @JvmStatic
     fun queryLoveHome(): String {
-        val start = "20251022"
-        val end = "20251217"
-        val args = "[{\"calenderEnd\":\"" + end +
-                "\",\"calenderStart\":\"" + start +
-                "\",\"source\":\"chInfo_ch_appcenter__chsub_9patch\"}]"
+        val args = "[{\"source\":\"chInfo_ch_appcenter__chsub_9patch\"}]"
         return RequestManager.requestString(
             "alipay.greenmatrix.rpc.h5.love.loveHome",
             args
@@ -150,6 +142,11 @@ object AntCooperateRpcCall {
             args
         )
     }
+
+    fun queryTeamMemberList(teamId: String): String = RequestManager.requestString(
+        "alipay.antforest.forest.h5.queryTeamMemberList",
+        JSONArray().put(JSONObject().put("source", "chInfo_ch_appcenter__chsub_9patch").put("teamId", teamId)).toString(),
+    )
 
     /**
      * 组队版浇水

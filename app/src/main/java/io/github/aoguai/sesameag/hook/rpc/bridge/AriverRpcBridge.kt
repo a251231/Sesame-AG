@@ -2,6 +2,9 @@ package io.github.aoguai.sesameag.hook.rpc.bridge
 
 import io.github.aoguai.sesameag.data.General
 import io.github.aoguai.sesameag.entity.RpcEntity
+import io.github.aoguai.sesameag.hook.RpcFallbackJsonFactory
+import io.github.aoguai.sesameag.hook.rpc.RpcDailyCircuit
+import org.json.JSONObject
 import io.github.aoguai.sesameag.hook.rpc.capture.RpcTrafficCapture
 import io.github.aoguai.sesameag.hook.rpc.intervallimit.RpcIntervalLimit
 import io.github.aoguai.sesameag.model.BaseModel
@@ -12,40 +15,56 @@ import io.github.aoguai.sesameag.util.Notify
 import io.github.aoguai.sesameag.util.RandomUtil
 import io.github.aoguai.sesameag.util.RpcOfflineRisk
 import io.github.aoguai.sesameag.util.TimeUtil
+import io.github.aoguai.sesameag.util.WorkflowRootGuard
+import kotlinx.coroutines.CancellationException
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
-private fun truncateForLog(value: String?, limit: Int): String {
+private fun truncateForLog(
+    value: String?,
+    limit: Int,
+): String {
     if (value == null) return ""
     if (value.length <= limit) return value
     return value.substring(0, limit) + "..."
 }
 
-private fun getErrorValueAsString(obj: Any, key: String): String {
-    return runCatching {
+private fun getErrorValueAsString(
+    obj: Any,
+    key: String,
+): String =
+    runCatching {
         callMethod(obj, "getString", key) as? String
     }.getOrNull()?.takeIf { it.isNotBlank() }
         ?: runCatching {
             callMethod(obj, "get", key)?.toString()
         }.getOrNull().orEmpty()
-}
 
-private fun loadClass(classLoader: ClassLoader, className: String): Class<*> {
-    return Class.forName(className, false, classLoader)
-}
+private fun loadClass(
+    classLoader: ClassLoader,
+    className: String,
+): Class<*> = Class.forName(className, false, classLoader)
 
-private fun callMethod(target: Any, name: String, vararg args: Any?): Any? {
-    return findCompatibleMethod(target.javaClass, name, *args).invoke(target, *args)
-}
+private fun callMethod(
+    target: Any,
+    name: String,
+    vararg args: Any?,
+): Any? = findCompatibleMethod(target.javaClass, name, *args).invoke(target, *args)
 
-private fun callStaticMethod(targetClass: Class<*>, name: String, vararg args: Any?): Any? {
-    return findCompatibleMethod(targetClass, name, *args).invoke(null, *args)
-}
+private fun callStaticMethod(
+    targetClass: Class<*>,
+    name: String,
+    vararg args: Any?,
+): Any? = findCompatibleMethod(targetClass, name, *args).invoke(null, *args)
 
-private fun findCompatibleMethod(targetClass: Class<*>, name: String, vararg args: Any?): Method {
+private fun findCompatibleMethod(
+    targetClass: Class<*>,
+    name: String,
+    vararg args: Any?,
+): Method {
     val candidates = linkedSetOf<Method>()
     candidates.addAll(targetClass.methods)
     var current: Class<*>? = targetClass
@@ -53,26 +72,30 @@ private fun findCompatibleMethod(targetClass: Class<*>, name: String, vararg arg
         candidates.addAll(current.declaredMethods)
         current = current.superclass
     }
-    return candidates.firstOrNull { method ->
-        method.name == name &&
-            method.parameterCount == args.size &&
-            method.parameterTypes.indices.all { index ->
-                isArgumentCompatible(method.parameterTypes[index], args[index])
-            }
-    }?.apply {
-        isAccessible = true
-    } ?: throw NoSuchMethodException("${targetClass.name}#$name(${args.size})")
+    return candidates
+        .firstOrNull { method ->
+            method.name == name &&
+                method.parameterCount == args.size &&
+                method.parameterTypes.indices.all { index ->
+                    isArgumentCompatible(method.parameterTypes[index], args[index])
+                }
+        }?.apply {
+            isAccessible = true
+        } ?: throw NoSuchMethodException("${targetClass.name}#$name(${args.size})")
 }
 
-private fun isArgumentCompatible(parameterType: Class<*>, argument: Any?): Boolean {
+private fun isArgumentCompatible(
+    parameterType: Class<*>,
+    argument: Any?,
+): Boolean {
     if (argument == null) {
         return !parameterType.isPrimitive
     }
-    return boxType(parameterType).isAssignableFrom(boxType(argument.javaClass))
+    return boxType(parameterType).isAssignableFrom(argument.javaClass)
 }
 
-private fun boxType(type: Class<*>): Class<*> {
-    return when (type) {
+private fun boxType(type: Class<*>): Class<*> =
+    when (type) {
         java.lang.Boolean.TYPE -> java.lang.Boolean::class.java
         java.lang.Byte.TYPE -> java.lang.Byte::class.java
         java.lang.Character.TYPE -> java.lang.Character::class.java
@@ -84,10 +107,9 @@ private fun boxType(type: Class<*>): Class<*> {
         java.lang.Void.TYPE -> java.lang.Void::class.java
         else -> type
     }
-}
 
 /**
- * 当前 RPC 桥接实现，最低支持支付宝版本 v10.3.96.8100。
+ * 当前 RPC 桥接实现，最低支持目标应用版本 v10.3.96.8100。
  */
 class AriverRpcBridge : RpcBridge {
     private var loader: ClassLoader? = null
@@ -96,7 +118,7 @@ class AriverRpcBridge : RpcBridge {
     private var bridgeCallbackClazzArray: Array<Class<*>>? = null
     private var rpcCallMethod: Method? = null
     private val maxErrorCount = AtomicInteger(0)
-    private val setMaxErrorCount: Int = BaseModel.setMaxErrorCount.value ?: 10
+    private val maxErrorThreshold: Int = BaseModel.setMaxErrorCount.value ?: 10
 
     private val errorMark = arrayListOf("1004", "46", "48")
     private val errorStringMark = arrayListOf("繁忙", "拒绝", "网络不可用", "重试")
@@ -108,7 +130,7 @@ class AriverRpcBridge : RpcBridge {
 
     private data class ErrorSummaryWindowStat(
         var windowStartMs: Long,
-        var count: Int
+        var count: Int,
     )
 
     private val errorSummaryWindowStats = ConcurrentHashMap<String, ErrorSummaryWindowStat>()
@@ -119,16 +141,20 @@ class AriverRpcBridge : RpcBridge {
     private val lastReloginAtMs = AtomicLong(0)
     private val reloginIntervalMs = RELOGIN_INTERVAL_MS
 
-    private fun offlineCooldownMs(): Long {
-        return io.github.aoguai.sesameag.hook.ApplicationHookConstants.getOfflineCooldownMs()
-    }
+    private fun offlineCooldownMs(): Long =
+        io.github.aoguai.sesameag.hook.ApplicationHookConstants
+            .getOfflineCooldownMs()
 
-    private fun computeRetryDelayMs(retryInterval: Int, attempt: Int): Long {
-        val baseMs = when {
-            retryInterval < 0 -> (600L + RandomUtil.delay().toLong())
-            retryInterval > 0 -> retryInterval.toLong()
-            else -> (600L + RandomUtil.delay().toLong())
-        }
+    private fun computeRetryDelayMs(
+        retryInterval: Int,
+        attempt: Int,
+    ): Long {
+        val baseMs =
+            if (retryInterval > 0) {
+                retryInterval.toLong()
+            } else {
+                600L + RandomUtil.delay().toLong()
+            }
 
         val errorExp = maxErrorCount.get().coerceAtLeast(0).coerceAtMost(4)
         val attemptExp = (attempt - 1).coerceAtLeast(0).coerceAtMost(2)
@@ -138,23 +164,26 @@ class AriverRpcBridge : RpcBridge {
         return minOf(baseMs * factor, 15000L)
     }
 
-    private fun isAuthLikeError(errorCode: String, errorMessage: String): Boolean {
-        return RpcOfflineRisk.isOfflineRisk(errorCode, errorMessage)
-    }
+    private fun isAuthLikeError(
+        errorCode: String,
+        errorMessage: String,
+    ): Boolean = RpcOfflineRisk.isOfflineRisk(errorCode, errorMessage)
 
-    private fun isRetryableRpcError(errorCode: String, errorMessage: String): Boolean {
-        return errorMark.contains(errorCode) ||
+    private fun isRetryableRpcError(
+        errorCode: String,
+        errorMessage: String,
+    ): Boolean =
+        errorMark.contains(errorCode) ||
             errorStringMark.contains(errorMessage) ||
             retryableErrorMessageKeywords.any { keyword -> errorMessage.contains(keyword, ignoreCase = true) }
-    }
 
     private fun buildOfflineDetail(
         methodName: String?,
         errorCode: String,
         errorMessage: String,
-        reason: String
-    ): String {
-        return buildString {
+        reason: String,
+    ): String =
+        buildString {
             if (!methodName.isNullOrBlank()) {
                 append("method=")
                 append(methodName)
@@ -175,38 +204,23 @@ class AriverRpcBridge : RpcBridge {
                 append(reason)
             }
         }
-    }
 
     private fun handleAuthLikeError(
         rpcEntity: RpcEntity,
         methodName: String?,
-        statusText: String,
-        notifyTitle: String,
-        response: String?,
         reason: String,
         offlineDetail: String = reason,
-        count: Int
+        count: Int,
     ): RpcEntity? {
         maxErrorCount.set(0)
         val wasOffline = io.github.aoguai.sesameag.hook.ApplicationHookConstants.offline
         val cooldownMs = offlineCooldownMs()
-        if (!wasOffline) {
-            Notify.updateRunningStatus(statusText)
-            if (BaseModel.errNotify.value == true &&
-                shouldNotifyNow(lastErrorNotifyAtMs, errorNotifyIntervalMs)
-            ) {
-                Notify.sendAlert(
-                    "${TimeUtil.getTimeStr()} | $notifyTitle",
-                    response.orEmpty()
-                )
-            }
-        }
-
+        // 常驻标题与离线告警统一由 enterOffline 单点驱动，此处不再重复设置/发送
         if (!wasOffline) {
             io.github.aoguai.sesameag.hook.ApplicationHookConstants.enterOffline(
                 cooldownMs,
                 "auth_like",
-                offlineDetail
+                offlineDetail,
             )
         }
 
@@ -215,7 +229,8 @@ class AriverRpcBridge : RpcBridge {
                 shouldNotifyNow(lastReloginAtMs, reloginIntervalMs)
         if (!wasOffline && shouldTryRelogin) {
             Log.record(TAG, "尝试重新登录")
-            io.github.aoguai.sesameag.hook.ApplicationHookUtils.reLoginByBroadcast()
+            io.github.aoguai.sesameag.hook.ApplicationHookUtils
+                .reLoginByBroadcast()
         }
 
         logNullResponse(rpcEntity, reason, count)
@@ -224,27 +239,32 @@ class AriverRpcBridge : RpcBridge {
 
     override fun load() {
         loader = io.github.aoguai.sesameag.hook.ApplicationHook.classLoader
-        val classLoader = loader ?: run {
-            Log.error(TAG, "ClassLoader为null，无法加载NewRpcBridge")
-            return
-        }
-        
+        val classLoader =
+            loader ?: run {
+                Log.error(TAG, "ClassLoader为null，无法加载NewRpcBridge")
+                return
+            }
+
         try {
-            val service = callStaticMethod(
-                loadClass(classLoader, "com.alipay.mobile.nebulacore.Nebula"),
-                "getService"
-            )
-            val extensionManager = service?.let { callMethod(it, "getExtensionManager") }
-                ?: throw RuntimeException("getExtensionManager is null")
-            val getExtensionByName = extensionManager.javaClass.getDeclaredMethod(
-                "createExtensionInstance",
-                Class::class.java
-            )
+            val service =
+                callStaticMethod(
+                    loadClass(classLoader, "com.alipay.mobile.nebulacore.Nebula"),
+                    "getService",
+                )
+            val extensionManager =
+                service?.let { callMethod(it, "getExtensionManager") }
+                    ?: throw RuntimeException("getExtensionManager is null")
+            val getExtensionByName =
+                extensionManager.javaClass.getDeclaredMethod(
+                    "createExtensionInstance",
+                    Class::class.java,
+                )
             getExtensionByName.isAccessible = true
-            rpcBridgeExtensionInstance = getExtensionByName.invoke(
-                null,
-                classLoader.loadClass("com.alibaba.ariver.commonability.network.rpc.RpcBridgeExtension")
-            )
+            rpcBridgeExtensionInstance =
+                getExtensionByName.invoke(
+                    null,
+                    classLoader.loadClass("com.alibaba.ariver.commonability.network.rpc.RpcBridgeExtension"),
+                )
 
             if (rpcBridgeExtensionInstance == null) {
                 val nodeExtensionMap = callMethod(extensionManager, "getNodeExtensionMap")
@@ -266,33 +286,37 @@ class AriverRpcBridge : RpcBridge {
                 }
             }
 
-            parseObjectMethod = classLoader.loadClass("com.alibaba.fastjson.JSON")
-                .getMethod("parseObject", String::class.java)
-            val bridgeCallbackClazz = classLoader.loadClass(
-                "com.alibaba.ariver.engine.api.bridge.extension.BridgeCallback"
-            )
+            parseObjectMethod =
+                classLoader
+                    .loadClass("com.alibaba.fastjson.JSON")
+                    .getMethod("parseObject", String::class.java)
+            val bridgeCallbackClazz =
+                classLoader.loadClass(
+                    "com.alibaba.ariver.engine.api.bridge.extension.BridgeCallback",
+                )
             bridgeCallbackClazzArray = arrayOf(bridgeCallbackClazz)
-            
+
             val rpcInstance = rpcBridgeExtensionInstance ?: throw RuntimeException("rpcBridgeExtensionInstance is null")
-            rpcCallMethod = rpcInstance.javaClass.getMethod(
-                "rpc",
-                String::class.java,
-                Boolean::class.javaPrimitiveType,
-                Boolean::class.javaPrimitiveType,
-                String::class.java,
-                classLoader.loadClass(General.JSON_OBJECT_NAME),
-                String::class.java,
-                classLoader.loadClass(General.JSON_OBJECT_NAME),
-                Boolean::class.javaPrimitiveType,
-                Boolean::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                Boolean::class.javaPrimitiveType,
-                String::class.java,
-                classLoader.loadClass("com.alibaba.ariver.app.api.App"),
-                classLoader.loadClass("com.alibaba.ariver.app.api.Page"),
-                classLoader.loadClass("com.alibaba.ariver.engine.api.bridge.model.ApiContext"),
-                bridgeCallbackClazz
-            )
+            rpcCallMethod =
+                rpcInstance.javaClass.getMethod(
+                    "rpc",
+                    String::class.java,
+                    Boolean::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType,
+                    String::class.java,
+                    classLoader.loadClass(General.JSON_OBJECT_NAME),
+                    String::class.java,
+                    classLoader.loadClass(General.JSON_OBJECT_NAME),
+                    Boolean::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType,
+                    String::class.java,
+                    classLoader.loadClass("com.alibaba.ariver.app.api.App"),
+                    classLoader.loadClass("com.alibaba.ariver.app.api.Page"),
+                    classLoader.loadClass("com.alibaba.ariver.engine.api.bridge.model.ApiContext"),
+                    bridgeCallbackClazz,
+                )
             Log.runtime(TAG, "get rpcCallMethod successfully")
         } catch (e: Exception) {
             Log.runtime(TAG, "get rpcCallMethod err:")
@@ -308,11 +332,33 @@ class AriverRpcBridge : RpcBridge {
         loader = null
     }
 
-    override fun requestString(rpcEntity: RpcEntity, tryCount: Int, retryInterval: Int): String? {
-        return requestObject(rpcEntity, tryCount, retryInterval)?.responseString
-    }
+    override fun requestString(
+        rpcEntity: RpcEntity,
+        tryCount: Int,
+        retryInterval: Int,
+    ): String? = requestObject(rpcEntity, tryCount, retryInterval)?.responseString
 
-    override fun requestObject(rpcEntity: RpcEntity, tryCount: Int, retryInterval: Int): RpcEntity? {
+    override fun requestObject(
+        rpcEntity: RpcEntity,
+        tryCount: Int,
+        retryInterval: Int,
+    ): RpcEntity? {
+        val identity = rpcEntity.requestIdentity ?: RpcDailyCircuit.captureIdentity().also {
+            rpcEntity.requestIdentity = it
+        }
+        if (!RpcDailyCircuit.isCurrent(identity)) {
+            rpcEntity.settingsRefresh?.failed = true
+            return null
+        }
+        if (rpcEntity.settingsRefresh == null && RpcDailyCircuit.isBlockedToday(identity.userId, rpcEntity.requestMethod)) {
+            rpcEntity.setResponseObject(null, RpcFallbackJsonFactory.buildDailyRiskStop(rpcEntity.requestMethod))
+            rpcEntity.setError()
+            return rpcEntity
+        }
+        if (!WorkflowRootGuard.isExecutionAllowed()) {
+            Log.record(TAG, "必需权限或使用协议未就绪，已拒绝 RPC 请求")
+            return null
+        }
         // 方法开始时，将成员变量赋值给局部变量，以避免在方法执行期间因其他线程的unload()调用而导致成员变量变为null
         var localRpcCallMethod = rpcCallMethod
         var localParseObjectMethod = parseObjectMethod
@@ -321,15 +367,21 @@ class AriverRpcBridge : RpcBridge {
         var localBridgeCallbackClazzArray = bridgeCallbackClazzArray
         val captureMethodName = rpcEntity.requestMethod
         val captureModuleTraffic = BaseModel.debugMode.value == true && !captureMethodName.isNullOrBlank()
+        val captureRequestId = if (captureModuleTraffic) RpcTrafficCapture.newRequestId() else null
         val captureStartedAtMs = if (captureModuleTraffic) System.currentTimeMillis() else 0L
         var captureSucceeded = false
         var captureNote: String? = null
+        var captureAttemptId: String? = null
+        var captureAttemptResponseRecorded = false
+        var hardBlocked = false
 
         if (captureModuleTraffic) {
-            RpcTrafficCapture.recordModuleRequest(captureMethodName, rpcEntity.requestData)
+            RpcTrafficCapture.recordModuleRequest(captureMethodName, rpcEntity.requestData, captureRequestId!!)
         }
 
-        if (io.github.aoguai.sesameag.hook.ApplicationHookConstants.shouldBlockRpc()) {
+        if (io.github.aoguai.sesameag.hook.ApplicationHookConstants
+                .shouldBlockRpc()
+        ) {
             captureNote = "blocked_by_offline"
             return null
         }
@@ -370,12 +422,45 @@ class AriverRpcBridge : RpcBridge {
             requestLoop@ do {
                 count++
                 try {
-                    val requestMethod = rpcEntity.requestMethod ?: run {
-                        Log.error(TAG, "requestMethod为null")
-                        return null
+                    val requestMethod =
+                        rpcEntity.requestMethod ?: run {
+                            Log.error(TAG, "requestMethod为null")
+                            return null
+                        }
+                    val attemptStartedAtMs = if (captureModuleTraffic) System.currentTimeMillis() else 0L
+                    val attemptId = if (captureModuleTraffic) RpcTrafficCapture.newAttemptId() else null
+                    captureAttemptId = attemptId
+                    if (captureModuleTraffic) {
+                        RpcTrafficCapture.recordModuleAttempt(
+                            captureMethodName,
+                            rpcEntity.requestData,
+                            captureRequestId!!,
+                            attemptId!!,
+                            count,
+                        )
                     }
                     RpcIntervalLimit.enterIntervalLimit(requestMethod)
+                    if (!RpcDailyCircuit.isCurrent(identity)) {
+                        rpcEntity.settingsRefresh?.failed = true
+                        return null
+                    }
+                    if (rpcEntity.settingsRefresh == null && RpcDailyCircuit.isBlockedToday(identity.userId, requestMethod)) {
+                        captureNote = "blocked_by_daily_risk_stop"
+                        rpcEntity.setResponseObject(null, RpcFallbackJsonFactory.buildDailyRiskStop(requestMethod))
+                        rpcEntity.setError()
+                        return rpcEntity
+                    }
+                    if (io.github.aoguai.sesameag.hook.ApplicationHookConstants.shouldBlockRpc()) {
+                        rpcEntity.settingsRefresh?.failed = true
+                        captureNote = "blocked_by_offline"
+                        return null
+                    }
+                    if (!WorkflowRootGuard.isExecutionAllowed()) {
+                        captureNote = "blocked_by_execution_prerequisites"
+                        return null
+                    }
                     val finalLocalBridgeCallbackClazzArray = localBridgeCallbackClazzArray
+                    rpcEntity.settingsRefresh?.recordMethod(requestMethod)
                     localRpcCallMethod.invoke(
                         localRpcBridgeExtensionInstance,
                         rpcEntity.requestMethod,
@@ -395,35 +480,53 @@ class AriverRpcBridge : RpcBridge {
                         null,
                         Proxy.newProxyInstance(
                             localLoader,
-                            localBridgeCallbackClazzArray
+                            localBridgeCallbackClazzArray,
                         ) { proxy, method, args ->
                             when (method.name) {
-                                "equals" -> proxy === args?.get(0)
-                                "hashCode" -> System.identityHashCode(proxy)
-                                "toString" -> "Proxy for ${finalLocalBridgeCallbackClazzArray[0].name}"
+                                "equals" -> {
+                                    proxy === args?.get(0)
+                                }
+
+                                "hashCode" -> {
+                                    System.identityHashCode(proxy)
+                                }
+
+                                "toString" -> {
+                                    "Proxy for ${finalLocalBridgeCallbackClazzArray[0].name}"
+                                }
+
                                 "sendJSONResponse" -> {
                                     if (args != null && args.isNotEmpty()) {
                                         try {
                                             val obj = args[0]
-                                            // 获取JSON字符串，失败时重试一次
-                                            var jsonString: String? = null
-                                            try {
-                                                jsonString = callMethod(obj, "toJSONString") as String
-                                            } catch (e: Exception) {
-                                                // 第一次失败，尝试重试
+                                            // 获取JSON字符串，失败时重试一次。
+                                            val jsonString =
                                                 try {
-                                                    GlobalThreadPools.sleepCompat(100L)
-                                                    jsonString = callMethod(obj, "toJSONString") as String
-                                                } catch (retryException: Exception) {
-                                                    // 重试后仍失败，记录日志并标记错误，触发外层RPC重试
-                                                    Log.runtime(TAG, "toJSONString 重试后仍然失败，将触发整个 RPC 请求重试: ${retryException.message}")
-                                                    rpcEntity.setResponseObject(obj, null)
-                                                    rpcEntity.setError()
-                                                    return@newProxyInstance null
+                                                    callMethod(obj, "toJSONString") as String
+                                                } catch (e: Exception) {
+                                                    try {
+                                                        GlobalThreadPools.sleepCompat(100L)
+                                                        callMethod(obj, "toJSONString") as String
+                                                    } catch (retryException: Exception) {
+                                                        // 重试后仍失败，记录日志并标记错误，触发外层RPC重试
+                                                        Log.runtime(TAG, "toJSONString 重试后仍然失败，将触发整个 RPC 请求重试: ${retryException.message}")
+                                                        rpcEntity.setResponseObject(obj, null)
+                                                        rpcEntity.setError()
+                                                        return@newProxyInstance null
+                                                    }
                                                 }
-                                            }
 
                                             rpcEntity.setResponseObject(obj, jsonString)
+                                            if (captureModuleTraffic) {
+                                                RpcTrafficCapture.recordModuleResponse(
+                                                    captureMethodName,
+                                                    jsonString,
+                                                    System.currentTimeMillis() - attemptStartedAtMs,
+                                                    captureRequestId,
+                                                    attemptId,
+                                                )
+                                                captureAttemptResponseRecorded = true
+                                            }
                                             if (!(callMethod(obj, "containsKey", "success") as Boolean) &&
                                                 !(callMethod(obj, "containsKey", "isSuccess") as Boolean)
                                             ) {
@@ -436,23 +539,24 @@ class AriverRpcBridge : RpcBridge {
                                                 if (isMarkedNetworkError) {
                                                     logErrorSummary(methodName, errorCode, errorMessage)
                                                 } else {
-                                                    val message = buildString {
-                                                        append("rpc response1 | id: ")
-                                                        append(rpcEntity.hashCode())
-                                                        append(" | method: ")
-                                                        append(rpcEntity.requestMethod)
-                                                        append("\n")
-                                                        append("args: ")
-                                                        append(truncateForLog(rpcEntity.requestData, 1024))
-                                                        append(" |\n")
-                                                        append("data: ")
-                                                        append(
-                                                            truncateForLog(
-                                                                rpcEntity.responseString,
-                                                                4096
+                                                    val message =
+                                                        buildString {
+                                                            append("rpc response1 | id: ")
+                                                            append(rpcEntity.hashCode())
+                                                            append(" | method: ")
+                                                            append(rpcEntity.requestMethod)
+                                                            append("\n")
+                                                            append("args: ")
+                                                            append(truncateForLog(rpcEntity.requestData, 1024))
+                                                            append(" |\n")
+                                                            append("data: ")
+                                                            append(
+                                                                truncateForLog(
+                                                                    rpcEntity.responseString,
+                                                                    4096,
+                                                                ),
                                                             )
-                                                        )
-                                                    }
+                                                        }
                                                     Log.error(TAG, message)
                                                 }
                                             }
@@ -460,19 +564,23 @@ class AriverRpcBridge : RpcBridge {
                                             rpcEntity.setError()
                                             Log.error(
                                                 TAG,
-                                                "rpc response2 | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} err:"
+                                                "rpc response2 | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} err:",
                                             )
                                             Log.printStackTrace(e)
                                         }
                                     }
                                     null
                                 }
-                                else -> null
+
+                                else -> {
+                                    null
+                                }
                             }
-                        }
+                        },
                     )
 
                     if (!rpcEntity.hasResult) {
+                        rpcEntity.settingsRefresh?.failed = true
                         logNullResponse(rpcEntity, "无响应结果", count)
                         if (count < normalizedTryCount) {
                             CoroutineUtils.sleepCompat(computeRetryDelayMs(retryInterval, count))
@@ -481,8 +589,29 @@ class AriverRpcBridge : RpcBridge {
                         return null
                     }
 
+                    if (!RpcDailyCircuit.isCurrent(identity)) {
+                        rpcEntity.settingsRefresh?.failed = true
+                        return null
+                    }
+                    val rawResponse = JSONObject(rpcEntity.responseString.orEmpty())
+                    rpcEntity.settingsRefresh?.observeResponse(rawResponse)
+                    if (RpcOfflineRisk.isHardBlocked(rawResponse)) {
+                        hardBlocked = true
+                        RpcDailyCircuit.markBlockedToday(identity, requestMethod)
+                        rpcEntity.setError()
+                        val code = RpcOfflineRisk.extractCode(rawResponse)
+                        val message = RpcOfflineRisk.extractMessage(rawResponse)
+                        handleAuthLikeError(
+                            rpcEntity, requestMethod, "硬阻塞: $code/$message",
+                            buildOfflineDetail(requestMethod, code, message, "访问受限"), count,
+                        )
+                        // 保留本次真实响应，不依赖随后 I07 包装中的全局历史来源。
+                        return rpcEntity
+                    }
+
                     if (!rpcEntity.hasError) {
                         maxErrorCount.set(0)
+                        captureSucceeded = true
                         return rpcEntity
                     }
 
@@ -499,12 +628,9 @@ class AriverRpcBridge : RpcBridge {
                             return handleAuthLikeError(
                                 rpcEntity = rpcEntity,
                                 methodName = methodName,
-                                statusText = "检测到访问受限，已进入离线模式",
-                                notifyTitle = "检测到访问受限，已进入离线模式",
-                                response = response,
                                 reason = "访问受限: $errorCode/$errorMessage",
                                 offlineDetail = buildOfflineDetail(methodName, errorCode, errorMessage, "访问受限"),
-                                count = count
+                                count = count,
                             )
                         }
 
@@ -512,11 +638,8 @@ class AriverRpcBridge : RpcBridge {
                             return handleAuthLikeError(
                                 rpcEntity = rpcEntity,
                                 methodName = methodName,
-                                statusText = "登录超时",
-                                notifyTitle = "登录超时",
-                                response = response,
                                 reason = "登录超时: $errorCode/$errorMessage",
-                                count = count
+                                count = count,
                             )
                         }
 
@@ -524,28 +647,23 @@ class AriverRpcBridge : RpcBridge {
                             val currentErrorCount = maxErrorCount.incrementAndGet()
                             if (!io.github.aoguai.sesameag.hook.ApplicationHookConstants.offline) {
                                 var enteredOffline = false
-                                if (currentErrorCount > setMaxErrorCount) {
+                                if (currentErrorCount > maxErrorThreshold) {
+                                    // 常驻标题与告警统一由 enterOffline 单点驱动
                                     io.github.aoguai.sesameag.hook.ApplicationHookConstants.enterOffline(
                                         offlineCooldownMs(),
                                         "network_error_threshold",
-                                        "current=$currentErrorCount threshold=$setMaxErrorCount"
+                                        "current=$currentErrorCount threshold=$maxErrorThreshold",
                                     )
                                     enteredOffline = true
-                                    Notify.updateRunningStatus("网络连接异常，已进入离线模式")
-                                    if (BaseModel.errNotify.value == true) {
-                                        Notify.sendAlert(
-                                            "${TimeUtil.getTimeStr()} | 网络异常次数超过阈值[$setMaxErrorCount]",
-                                            response
-                                        )
-                                    }
                                 }
 
-                                if (BaseModel.errNotify.value == true &&
+                                if (!enteredOffline &&
+                                    BaseModel.errNotify.value == true &&
                                     shouldNotifyNow(lastErrorNotifyAtMs, errorNotifyIntervalMs)
                                 ) {
                                     Notify.sendAlert(
                                         "${TimeUtil.getTimeStr()} | 网络异常: $methodName",
-                                        response
+                                        response,
                                     )
                                 }
 
@@ -556,7 +674,8 @@ class AriverRpcBridge : RpcBridge {
                                         !enteredOffline
                                 if (shouldTryRelogin) {
                                     Log.record(TAG, "尝试重新登录")
-                                    io.github.aoguai.sesameag.hook.ApplicationHookUtils.reLoginByBroadcast()
+                                    io.github.aoguai.sesameag.hook.ApplicationHookUtils
+                                        .reLoginByBroadcast()
                                 }
                             }
 
@@ -569,10 +688,15 @@ class AriverRpcBridge : RpcBridge {
                         }
                         captureSucceeded = true
                         return rpcEntity
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        throw e
                     } catch (e: Exception) {
                         Log.error(
                             TAG,
-                            "rpc response | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} get err:"
+                            "rpc response | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} get err:",
                         )
                         Log.printStackTrace(e)
                         captureNote = "response_parse_exception:${e.javaClass.simpleName}"
@@ -582,9 +706,16 @@ class AriverRpcBridge : RpcBridge {
                         CoroutineUtils.sleepCompat(computeRetryDelayMs(retryInterval, count))
                     }
                 } catch (t: Throwable) {
+                    rpcEntity.settingsRefresh?.failed = true
+                    if (hardBlocked) return rpcEntity
+                    if (t is CancellationException) throw t
+                    if (t is InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        throw t
+                    }
                     Log.error(
                         TAG,
-                        "rpc request | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} err:"
+                        "rpc request | id: ${rpcEntity.hashCode()} | method: ${rpcEntity.requestMethod} err:",
                     )
                     Log.printStackTrace(t)
                     captureNote = "request_exception:${t.javaClass.simpleName}"
@@ -600,26 +731,41 @@ class AriverRpcBridge : RpcBridge {
             return null
         } finally {
             if (captureModuleTraffic) {
-                val elapsedMs = if (captureStartedAtMs > 0L) {
-                    System.currentTimeMillis() - captureStartedAtMs
-                } else {
-                    -1L
-                }
-                if (captureSucceeded && !rpcEntity.hasError) {
-                    RpcTrafficCapture.recordModuleResponse(captureMethodName, rpcEntity.responseString, elapsedMs)
+                val elapsedMs =
+                    if (captureStartedAtMs > 0L) {
+                        System.currentTimeMillis() - captureStartedAtMs
+                    } else {
+                        -1L
+                    }
+                if (captureAttemptResponseRecorded) {
+                    // attempt 层已完整记录该请求响应，避免 finally 重复记录或误报为 null
+                } else if (captureSucceeded && !rpcEntity.hasError) {
+                    RpcTrafficCapture.recordModuleResponse(
+                        captureMethodName,
+                        rpcEntity.responseString,
+                        elapsedMs,
+                        captureRequestId,
+                        captureAttemptId,
+                    )
                 } else {
                     RpcTrafficCapture.recordModuleError(
                         captureMethodName,
                         rpcEntity.responseString,
                         elapsedMs,
-                        captureNote ?: if (rpcEntity.hasError) "rpc_entity_error" else "request_returned_null"
+                        captureNote ?: if (rpcEntity.hasError) "rpc_entity_error" else "request_returned_null",
+                        captureRequestId,
+                        captureAttemptId,
                     )
                 }
             }
         }
     }
 
-    private fun logNullResponse(rpcEntity: RpcEntity?, reason: String, count: Int) {
+    private fun logNullResponse(
+        rpcEntity: RpcEntity?,
+        reason: String,
+        count: Int,
+    ) {
         val methodName = rpcEntity?.requestMethod ?: "unknown"
         val now = System.currentTimeMillis()
         val last = lastNullResponseLogAtMs[methodName]
@@ -629,30 +775,36 @@ class AriverRpcBridge : RpcBridge {
         }
     }
 
-    private fun logErrorSummary(methodName: String, errorCode: String, errorMessage: String) {
+    private fun logErrorSummary(
+        methodName: String,
+        errorCode: String,
+        errorMessage: String,
+    ) {
         val key = "$methodName|$errorCode"
         val now = System.currentTimeMillis()
-        val stat = errorSummaryWindowStats.computeIfAbsent(key) {
-            ErrorSummaryWindowStat(windowStartMs = now, count = 0)
-        }
+        val stat =
+            errorSummaryWindowStats.computeIfAbsent(key) {
+                ErrorSummaryWindowStat(windowStartMs = now, count = 0)
+            }
 
         var summaryLog: String? = null
         var shouldLogDetail = false
         synchronized(stat) {
             if (now - stat.windowStartMs >= errorSummaryWindowMs) {
-                summaryLog = buildString {
-                    append("RPC错误汇总 | 方法: ")
-                    append(methodName)
-                    append(" | 错误: ")
-                    append(errorCode)
-                    append("/")
-                    append(errorMessage)
-                    append(" | 次数: ")
-                    append(stat.count)
-                    append(" | 窗口: ")
-                    append(errorSummaryWindowMs)
-                    append("ms")
-                }
+                summaryLog =
+                    buildString {
+                        append("RPC错误汇总 | 方法: ")
+                        append(methodName)
+                        append(" | 错误: ")
+                        append(errorCode)
+                        append("/")
+                        append(errorMessage)
+                        append(" | 次数: ")
+                        append(stat.count)
+                        append(" | 窗口: ")
+                        append(errorSummaryWindowMs)
+                        append("ms")
+                    }
                 stat.windowStartMs = now
                 stat.count = 0
                 shouldLogDetail = true
@@ -667,7 +819,10 @@ class AriverRpcBridge : RpcBridge {
         }
     }
 
-    private fun shouldNotifyNow(lastMs: AtomicLong, intervalMs: Long): Boolean {
+    private fun shouldNotifyNow(
+        lastMs: AtomicLong,
+        intervalMs: Long,
+    ): Boolean {
         val now = System.currentTimeMillis()
         val last = lastMs.get()
         if (now - last < intervalMs) return false
@@ -683,4 +838,3 @@ class AriverRpcBridge : RpcBridge {
         private const val RELOGIN_INTERVAL_MS: Long = 120_000L
     }
 }
-

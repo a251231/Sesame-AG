@@ -16,6 +16,7 @@ import androidx.compose.material.icons.rounded.Agriculture
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.CardMembership
 import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.EmojiEvents
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Forest
 import androidx.compose.material.icons.rounded.History
@@ -94,10 +95,11 @@ fun LogsContent(
 
 private fun iconFor(channel: LogChannel): ImageVector {
     return when (channel) {
-        LogChannel.FOREST -> Icons.Rounded.Forest
+        LogChannel.FOREST, LogChannel.FOREST_PATROL -> Icons.Rounded.Forest
         LogChannel.DODO -> Icons.Rounded.Description
-        LogChannel.ORCHARD, LogChannel.FISHPOND, LogChannel.FARM, LogChannel.STALL -> Icons.Rounded.Agriculture
-        LogChannel.MEMBER, LogChannel.SESAME_CREDIT -> Icons.Rounded.CardMembership
+        LogChannel.ORCHARD, LogChannel.FARM, LogChannel.STALL -> Icons.Rounded.Agriculture
+        LogChannel.GOLDEN_BEAN -> Icons.Rounded.EmojiEvents
+        LogChannel.MEMBER, LogChannel.YOUTH_PRIVILEGE, LogChannel.SESAME_CREDIT -> Icons.Rounded.CardMembership
         LogChannel.SPORTS -> Icons.AutoMirrored.Rounded.DirectionsRun
         LogChannel.DEBUG, LogChannel.RUNTIME -> Icons.Rounded.BugReport
         LogChannel.ERROR -> Icons.Rounded.ErrorOutline

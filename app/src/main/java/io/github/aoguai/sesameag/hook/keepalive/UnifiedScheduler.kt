@@ -85,8 +85,6 @@ object UnifiedScheduler {
 
     fun activeTaskCount(): Int = taskMap.size
 
-    fun hasScheduledTasks(): Boolean = taskMap.isNotEmpty()
-
     fun schedulePersistentTrigger(
         context: Context,
         name: String,
@@ -96,7 +94,8 @@ object UnifiedScheduler {
         payloadJson: String = "{}",
         toleranceMs: Long = PersistentScheduleDefaults.DEFAULT_TOLERANCE_MS,
         ownerUserId: String? = null,
-        sessionEpoch: Long = 0L
+        sessionEpoch: Long = 0L,
+        precisionPolicy: String = PersistentSchedulePrecisionPolicy.defaultForKind(kind),
     ): PersistentSchedule {
         val boundOwnerUserId = ownerUserId?.trim()?.takeIf { it.isNotEmpty() }
             ?: AccountSessionCoordinator.currentUserId()
@@ -111,6 +110,7 @@ object UnifiedScheduler {
             kind = kind,
             triggerAtMs = triggerAtMs,
             toleranceMs = toleranceMs,
+            precisionPolicy = precisionPolicy,
             dedupeKey = dedupeKey,
             payloadJson = payloadJson,
             ownerUserId = boundOwnerUserId,
@@ -155,6 +155,7 @@ object UnifiedScheduler {
     }
 
     fun cleanup() {
+        SystemWakeScheduler.cancelLocalTimer()
         cancelAll()
         _scope?.cancel()
         _scope = null

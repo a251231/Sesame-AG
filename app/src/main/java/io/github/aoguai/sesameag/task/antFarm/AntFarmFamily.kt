@@ -2,17 +2,19 @@ package io.github.aoguai.sesameag.task.antFarm
 
 import io.github.aoguai.sesameag.data.Status
 import io.github.aoguai.sesameag.data.StatusFlags
-import io.github.aoguai.sesameag.extensions.JSONExtensions.toJSONArray
+import io.github.aoguai.sesameag.hook.ApplicationHookConstants
 import io.github.aoguai.sesameag.model.modelFieldExt.FriendSelectionModelField
 import io.github.aoguai.sesameag.model.modelFieldExt.SelectModelField
 import io.github.aoguai.sesameag.task.antFarm.AntFarm.AnimalFeedStatus
 import io.github.aoguai.sesameag.task.antFarm.AntFarm.AnimalInteractStatus
 import io.github.aoguai.sesameag.task.antFarm.AntFarm.FamilyAssignStrategy
+import io.github.aoguai.sesameag.task.antFarm.AntFarm.FamilyShareMode
 import io.github.aoguai.sesameag.task.antSports.AntSportsRpcCall
 import io.github.aoguai.sesameag.util.GlobalThreadPools
 import io.github.aoguai.sesameag.util.Log
 import io.github.aoguai.sesameag.util.RandomUtil
 import io.github.aoguai.sesameag.util.ResChecker
+import io.github.aoguai.sesameag.util.friend.FriendRepository
 import io.github.aoguai.sesameag.util.friend.FriendSelectionResolver
 import io.github.aoguai.sesameag.util.maps.UserMap
 import org.json.JSONArray
@@ -20,10 +22,17 @@ import org.json.JSONObject
 import java.util.Calendar
 import java.util.Objects
 import kotlin.math.abs
+import kotlin.math.min
 
 data object AntFarmFamily {
     private const val TAG = "AntFarmFamily"
     private const val DAILY_DONATE_TASK_ID = "DAILY_DONATE"
+    private const val FAMILY_MEMBER_LIMIT = 6
+
+    private data class DecorationExchangeConfirmation(
+        val confirmed: Boolean,
+        val balanceCent: Int?,
+    )
 
     /**
      * 家庭ID
@@ -60,10 +69,20 @@ data object AntFarmFamily {
         val userName: String,
         val todayIntimateNum: Int,
         val totalIntimateNum: Int,
-        val userDonateCount: Int
+        val userDonateCount: Int,
     )
 
-    private fun hasFamilyOption(familyOptions: SelectModelField, vararg optionKeys: String): Boolean {
+    private data class FamilyCuisineCandidate(
+        val cuisine: JSONObject,
+        val cuisineId: String,
+        val availableCount: Int,
+        val knownEggProduce: Double?,
+    )
+
+    private fun hasFamilyOption(
+        familyOptions: SelectModelField,
+        vararg optionKeys: String,
+    ): Boolean {
         val values = familyOptions.value ?: return false
         return optionKeys.any { values.contains(it) }
     }
@@ -128,8 +147,8 @@ data object AntFarmFamily {
         }
     }
 
-    private fun queryFamilyTreadMillState(): JSONObject? {
-        return try {
+    private fun queryFamilyTreadMillState(): JSONObject? =
+        try {
             val treadMillRes = JSONObject(AntFarmRpcCall.familyTreadMill())
             if (!ResChecker.checkRes(TAG, treadMillRes)) {
                 null
@@ -140,7 +159,20 @@ data object AntFarmFamily {
             Log.printStackTrace(TAG, "queryFamilyTreadMillState err:", t)
             null
         }
-    }
+
+    private fun findCurrentFamilyMemberState(
+        treadMillJo: JSONObject?,
+        currentUid: String,
+    ): JSONObject? =
+        treadMillJo
+            ?.optJSONArray("familyMemberInfoList")
+            ?.let { memberList ->
+                (0 until memberList.length())
+                    .mapNotNull { memberList.optJSONObject(it) }
+                    .firstOrNull {
+                        it.optBoolean("currentUser", false) || it.optString("userId") == currentUid
+                    }
+            }
 
     private fun JSONObject.optIntOrNull(key: String): Int? {
         if (!has(key) || isNull(key)) {
@@ -151,7 +183,8 @@ data object AntFarmFamily {
 
     private fun normalizeAssignableUserIds(userIds: Collection<String>): List<String> {
         val currentUid = UserMap.currentUid
-        return userIds.asSequence()
+        return userIds
+            .asSequence()
             .map { it.trim() }
             .filter { it.isNotBlank() && it != currentUid }
             .distinct()
@@ -172,14 +205,16 @@ data object AntFarmFamily {
             return null
         }
         val candidateIdSet = candidateIds.toSet()
-        val treadMillJo = queryFamilyTreadMillState() ?: run {
-            Log.farm("家庭任务🏡[使用顶梁柱特权] 获取家庭贡献信息失败，回退随机安排")
-            return null
-        }
-        val memberList = treadMillJo.optJSONArray("familyMemberInfoList") ?: run {
-            Log.farm("家庭任务🏡[使用顶梁柱特权] familyTreadMill 缺少 familyMemberInfoList，回退随机安排")
-            return null
-        }
+        val treadMillJo =
+            queryFamilyTreadMillState() ?: run {
+                Log.farm("家庭任务🏡[使用顶梁柱特权] 获取家庭贡献信息失败，回退随机安排")
+                return null
+            }
+        val memberList =
+            treadMillJo.optJSONArray("familyMemberInfoList") ?: run {
+                Log.farm("家庭任务🏡[使用顶梁柱特权] familyTreadMill 缺少 familyMemberInfoList，回退随机安排")
+                return null
+            }
         val candidates = mutableListOf<FamilyAssignCandidate>()
         for (index in 0 until memberList.length()) {
             val member = memberList.optJSONObject(index) ?: continue
@@ -203,25 +238,28 @@ data object AntFarmFamily {
                     userName = member.optString("userName").trim(),
                     todayIntimateNum = todayIntimateNum,
                     totalIntimateNum = totalIntimateNum,
-                    userDonateCount = userDonateCount
-                )
+                    userDonateCount = userDonateCount,
+                ),
             )
         }
         if (candidates.size < candidateIds.size) {
             Log.farm("家庭任务🏡[使用顶梁柱特权] familyTreadMill 未返回完整家庭成员贡献信息，回退随机安排")
             return null
         }
-        val selected = candidates.sortedWith(
-            compareBy<FamilyAssignCandidate> { it.todayIntimateNum }
-                .thenBy { it.totalIntimateNum }
-                .thenBy { it.userDonateCount }
-                .thenBy { it.userId }
-        ).firstOrNull() ?: return null
-        val displayName = UserMap.getMaskName(selected.userId)
-            ?: selected.userName.ifBlank { selected.userId }
+        val selected =
+            candidates
+                .sortedWith(
+                    compareBy<FamilyAssignCandidate> { it.todayIntimateNum }
+                        .thenBy { it.totalIntimateNum }
+                        .thenBy { it.userDonateCount }
+                        .thenBy { it.userId },
+                ).firstOrNull() ?: return null
+        val displayName =
+            UserMap.getMaskName(selected.userId)
+                ?: selected.userName.ifBlank { selected.userId }
         Log.farm(
             "家庭任务🏡[使用顶梁柱特权] 优先安排今日亲密值最低成员[$displayName] " +
-                "today=${selected.todayIntimateNum}, total=${selected.totalIntimateNum}, donate=${selected.userDonateCount}"
+                "today=${selected.todayIntimateNum}, total=${selected.totalIntimateNum}, donate=${selected.userDonateCount}",
         )
         return selected.userId
     }
@@ -233,10 +271,11 @@ data object AntFarmFamily {
             Log.farm("$taskLogName#listFamilyTask 调用失败: ${formatFamilyTaskFailure(taskJo)}")
             return null
         }
-        val familyTasks = taskJo.optJSONArray("familyTasks") ?: run {
-            Log.farm("$taskLogName#familyTasks 为空")
-            return null
-        }
+        val familyTasks =
+            taskJo.optJSONArray("familyTasks") ?: run {
+                Log.farm("$taskLogName#familyTasks 为空")
+                return null
+            }
         for (index in 0 until familyTasks.length()) {
             val task = familyTasks.optJSONObject(index) ?: continue
             val bizKey = task.optString("bizKey")
@@ -268,7 +307,10 @@ data object AntFarmFamily {
             "resultCode=${resultCode.ifBlank { "<blank>" }}, response=$jo"
     }
 
-    private fun logDailyDonateTaskAward(taskTitle: String, task: JSONObject?) {
+    private fun logDailyDonateTaskAward(
+        taskTitle: String,
+        task: JSONObject?,
+    ) {
         val awardCount = extractFamilyTaskAwardCount(task)
         if (awardCount > 0) {
             Log.farm("家庭任务🏠$taskTitle🥚#亲密度+$awardCount")
@@ -277,7 +319,10 @@ data object AntFarmFamily {
         }
     }
 
-    private fun receiveDailyDonateTaskAward(taskTitle: String, task: JSONObject?): Boolean {
+    private fun receiveDailyDonateTaskAward(
+        taskTitle: String,
+        task: JSONObject?,
+    ): Boolean {
         val taskStatus = task?.optString("taskStatus").orEmpty()
         if (taskStatus == "RECEIVED") {
             logDailyDonateTaskAward(taskTitle, task)
@@ -326,17 +371,23 @@ data object AntFarmFamily {
         }
     }
 
-
     fun run(
         familyOptions: SelectModelField,
-        notInviteList: FriendSelectionModelField,
-        familyAssignStrategy: Int = FamilyAssignStrategy.RANDOM
+        familyShareList: FriendSelectionModelField,
+        familyShareMode: Int = FamilyShareMode.INVITE_SELECTED,
+        familyAssignStrategy: Int = FamilyAssignStrategy.RANDOM,
     ) {
         try {
-            enterFamily(familyOptions, notInviteList, familyAssignStrategy)
+            enterFamily(familyOptions, familyShareList, familyShareMode, familyAssignStrategy)
         } catch (e: Exception) {
             Log.printStackTrace(TAG, e)
         }
+    }
+
+    internal fun runMeal(farm: AntFarm) {
+        val options = farm.familyOptions ?: return
+        val shareList = farm.familyShareList ?: return
+        enterFamily(options, shareList, mealOnly = true)
     }
 
     /**
@@ -344,8 +395,10 @@ data object AntFarmFamily {
      */
     fun enterFamily(
         familyOptions: SelectModelField,
-        notInviteList: FriendSelectionModelField,
-        familyAssignStrategy: Int = FamilyAssignStrategy.RANDOM
+        familyShareList: FriendSelectionModelField,
+        familyShareMode: Int = FamilyShareMode.INVITE_SELECTED,
+        familyAssignStrategy: Int = FamilyAssignStrategy.RANDOM,
+        mealOnly: Boolean = false,
     ) {
         try {
             groupId = ""
@@ -357,34 +410,40 @@ data object AntFarmFamily {
             runCatching {
                 AntFarmRpcCall.refinedOperation("ENTERFAMILY")
             }
-            val enterRes = JSONObject(AntFarmRpcCall.enterFamily());
+            val enterRes = JSONObject(AntFarmRpcCall.enterFamily())
             if (ResChecker.checkRes(TAG, enterRes)) {
                 groupId = enterRes.optString("groupId")
                 groupName = enterRes.optString("groupName", enterRes.optString("familyName"))
-                val familySignTips: Boolean = enterRes.optBoolean("familySignTips", false)//签到
-                val assignFamilyMemberInfo: JSONObject? = enterRes.optJSONObject("assignFamilyMemberInfo")//分配成员信息-顶梁柱
-                familyAnimals = enterRes.optJSONArray("animals") ?: JSONArray()//家庭动物列表
+                val familySignTips: Boolean = enterRes.optBoolean("familySignTips", false) // 签到
+                val assignFamilyMemberInfo: JSONObject? = enterRes.optJSONObject("assignFamilyMemberInfo") // 分配成员信息-顶梁柱
+                familyAnimals = enterRes.optJSONArray("animals") ?: JSONArray() // 家庭动物列表
                 familyUserIds = buildFamilyUserIds(familyAnimals)
                 if (familyUserIds.isEmpty()) {
                     familyUserIds = buildFamilyUserIds(enterRes.optJSONArray("familyMemberInfoList"))
                 }
-                familyInteractActions = enterRes.optJSONArray("familyInteractActions") ?: JSONArray()//互动功能列表
-                eatTogetherConfig = enterRes.optJSONObject("eatTogetherConfig") ?: JSONObject()//美食配置对象
+                familyInteractActions = enterRes.optJSONArray("familyInteractActions") ?: JSONArray() // 互动功能列表
+                eatTogetherConfig = enterRes.optJSONObject("eatTogetherConfig") ?: JSONObject() // 美食配置对象
 
                 if (groupId.isBlank() || groupName.isBlank() || familyUserIds.isEmpty()) {
                     refreshFamilyBaseInfoFromQueryFamilyInfo()
                 }
                 if (groupId.isBlank()) {
-                    Log.farm("请先开通小鸡家庭");
-                    return;
+                    Log.farm("请先开通小鸡家庭")
+                    return
                 }
 
-                if (hasFamilyOption(familyOptions, "familySign") && familySignTips) {
-                    familySign()
+                if (familySignTips) familySign()
+                familyClaimRewardList()
+                if (mealOnly) {
+                    if (hasFamilyOption(familyOptions, "eatTogetherConfig")) {
+                        familyEatTogether(eatTogetherConfig, familyInteractActions, familyUserIds.toMutableList())
+                        familyClaimRewardList()
+                    }
+                    return
                 }
 
-                if (assignFamilyMemberInfo != null
-                    && hasFamilyOption(familyOptions, "assignRights")
+                if (assignFamilyMemberInfo != null &&
+                    hasFamilyOption(familyOptions, "assignRights")
                 ) {
                     val assignRights = assignFamilyMemberInfo.optJSONObject("assignRights")
                     val assignConfigList = assignFamilyMemberInfo.optJSONArray("assignConfigList")
@@ -401,16 +460,8 @@ data object AntFarmFamily {
                     }
                 }
 
-                if (hasFamilyOption(familyOptions, "familyClaimReward")) {
-                    familyClaimRewardList()
-                }
-
                 if (hasFamilyOption(familyOptions, "feedFamilyAnimal") && familyAnimals.length() > 0) {
                     familyFeedFriendAnimal(familyAnimals)
-                }
-
-                if (hasFamilyOption(familyOptions, "sleepTogether") && familyAnimals.length() > 0) {
-                    familySleepTogether(enterRes)
                 }
 
                 if (hasFamilyOption(familyOptions, "eatTogetherConfig") && eatTogetherConfig.length() > 0) {
@@ -426,14 +477,15 @@ data object AntFarmFamily {
                 }
 
                 if (hasFamilyOption(familyOptions, "shareToFriends", "inviteFriendVisitFamily")) {
-                    familyShareToFriends(familyUserIds.toMutableList(), notInviteList)
+                    familyShareToFriends(familyUserIds.toMutableList(), familyShareList, familyShareMode)
                 }
                 if (hasFamilyOption(familyOptions, "ExchangeFamilyDecoration")) {
                     autoExchangeFamilyDecoration()
                 }
+                familyClaimRewardList()
             }
         } catch (e: Exception) {
-            Log.printStackTrace(TAG,  e)
+            Log.printStackTrace(TAG, e)
         }
     }
 
@@ -449,7 +501,7 @@ data object AntFarmFamily {
                 Log.farm("家庭任务🏡每日签到")
             }
         } catch (e: Exception) {
-            Log.printStackTrace(TAG,  e)
+            Log.printStackTrace(TAG, e)
         }
     }
 
@@ -463,16 +515,22 @@ data object AntFarmFamily {
                 val ja = jo.getJSONArray("familyAwardRecordList")
                 for (i in 0..<ja.length()) {
                     jo = ja.getJSONObject(i)
-                    if (jo.optBoolean("expired")
-                        || jo.optBoolean("received", true)
-                        || jo.has("linkUrl")
-                        || (jo.has("operability") && !jo.getBoolean("operability"))
+                    if (jo.optBoolean("expired") ||
+                        jo.optBoolean("received", true) ||
+                        jo.has("linkUrl") ||
+                        (jo.has("operability") && !jo.getBoolean("operability"))
                     ) {
                         continue
                     }
                     val rightId = jo.getString("rightId")
                     val awardName = jo.getString("awardName")
                     val count = jo.optInt("count", 1)
+                    if (jo.optString("awardType") == "ALLPURPOSE" &&
+                        AntFarm.instance?.prepareFarmAwardCapacity(count) != true
+                    ) {
+                        Log.farm("家庭奖励[$awardName]饲料容量不足，保留后续领取")
+                        continue
+                    }
                     val receveRes = JSONObject(AntFarmRpcCall.receiveFamilyAward(rightId))
                     if (ResChecker.checkRes(TAG, receveRes)) {
                         Log.farm("家庭奖励🏆: $awardName x $count")
@@ -490,19 +548,20 @@ data object AntFarmFamily {
     fun assignFamilyMember(
         jsonObject: JSONObject,
         userIds: MutableList<String>,
-        familyAssignStrategy: Int = FamilyAssignStrategy.RANDOM
+        familyAssignStrategy: Int = FamilyAssignStrategy.RANDOM,
     ) {
         try {
-            val beAssignUser = if (familyAssignStrategy == FamilyAssignStrategy.LOWEST_TODAY_INTIMACY) {
-                selectLowestTodayIntimacyUser(userIds) ?: selectRandomAssignableUser(userIds)
-            } else {
-                selectRandomAssignableUser(userIds)
-            }
+            val beAssignUser =
+                if (familyAssignStrategy == FamilyAssignStrategy.LOWEST_TODAY_INTIMACY) {
+                    selectLowestTodayIntimacyUser(userIds) ?: selectRandomAssignableUser(userIds)
+                } else {
+                    selectRandomAssignableUser(userIds)
+                }
             if (beAssignUser.isNullOrBlank()) {
                 Log.farm("家庭任务🏡[使用顶梁柱特权] 无可安排家庭成员，跳过")
                 return
             }
-            //随机获取一个任务类型
+            // 随机获取一个任务类型
             val assignConfigList = jsonObject.optJSONArray("assignConfigList")
             if (assignConfigList == null || assignConfigList.length() == 0) {
                 Log.farm("家庭任务[使用顶梁柱特权] assignConfigList 为空，跳过")
@@ -521,10 +580,12 @@ data object AntFarmFamily {
                 Log.farm("家庭任务🏡[使用顶梁柱特权] $assignDesc -> [$displayName]")
 //                val sendRes = JSONObject(AntFarmRpcCall.sendChat(assignConfig.getString("chatCardType"), beAssignUser))
             } else {
-                val failMsg = jo.optString("resultDesc")
-                    .ifBlank { jo.optString("memo") }
-                    .ifBlank { jo.optString("errorMsg") }
-                    .ifBlank { jo.toString() }
+                val failMsg =
+                    jo
+                        .optString("resultDesc")
+                        .ifBlank { jo.optString("memo") }
+                        .ifBlank { jo.optString("errorMsg") }
+                        .ifBlank { jo.toString() }
                 Log.farm("家庭任务🏡[使用顶梁柱特权] $assignDesc 失败: $failMsg")
             }
         } catch (t: Throwable) {
@@ -554,7 +615,10 @@ data object AntFarmFamily {
 
                 // 过滤非 HOME / HUNGRY 的
                 if (interactStatus != AnimalInteractStatus.HOME.name ||
-                    feedStatus != AnimalFeedStatus.HUNGRY.name) continue
+                    feedStatus != AnimalFeedStatus.HUNGRY.name
+                ) {
+                    continue
+                }
 
                 val groupId = animal.getString("groupId")
                 val farmId = animal.getString("farmId")
@@ -581,7 +645,7 @@ data object AntFarmFamily {
                     val code = jo.optString("resultCode")
                     val memo = jo.optString("memo")
 
-                    if (code == "391" || memo.contains("今日帮喂次数已达上限")) {
+                    if (code == "391") {
                         // 记录该用户今日不能再喂
                         Status.setFlagToday(flagKey)
                         Status.setFlagToday(StatusFlags.FLAG_FARM_FEED_FRIEND_LIMIT)
@@ -604,79 +668,8 @@ data object AntFarmFamily {
                 Log.farm("家庭任务🏠帮喂小鸡🥣[$maskName]180g #剩余${foodStock}g")
                 continue
             }
-
         } catch (t: Throwable) {
-            Log.printStackTrace(TAG, "familyFeedFriendAnimal err:",t)
-        }
-    }
-
-    /**
-     * 家庭任务：去睡觉（SLEEP_TOGETHER）
-     *
-     */
-    private fun familySleepTogether(enterRes: JSONObject) {
-        try {
-            if (groupId.isEmpty()) return
-            if (Status.hasFlagToday(StatusFlags.FLAG_FARM_FAMILY_SLEEP_TOGETHER)) return
-
-            // 远端任务状态校验：只在 SLEEP_TOGETHER=TODO 时触发，避免误刷
-            val taskTipsRes = JSONObject(AntFarmRpcCall.familyTaskTips(familyAnimals))
-            if (!ResChecker.checkRes(TAG, taskTipsRes)) {
-                Log.error(TAG, "家庭任务🏠去睡觉#familyTaskTips 调用失败，跳过")
-                return
-            }
-
-            val taskTips = taskTipsRes.optJSONArray("familyTaskTips")
-            if (taskTips == null || taskTips.length() == 0) {
-                Status.setFlagToday(StatusFlags.FLAG_FARM_FAMILY_SLEEP_TOGETHER)
-                return
-            }
-
-            var hasSleepTodo = false
-            for (i in 0 until taskTips.length()) {
-                val item = taskTips.getJSONObject(i)
-                val bizKey = item.optString("bizKey")
-                val taskId = item.optString("taskId")
-                val taskStatus = item.optString("taskStatus")
-                if ((bizKey == "SLEEP_TOGETHER" || taskId == "SLEEP_TOGETHER") && taskStatus == "TODO") {
-                    hasSleepTodo = true
-                    break
-                }
-            }
-
-            if (!hasSleepTodo) {
-                Status.setFlagToday(StatusFlags.FLAG_FARM_FAMILY_SLEEP_TOGETHER)
-                return
-            }
-
-            // 部分版本 enterFamily 可能缺少 sleepNotifyInfo，这里默认允许尝试（由服务端返回结果兜底）
-            val canSleep = enterRes.optJSONObject("sleepNotifyInfo")?.optBoolean("canSleep", true) ?: true
-            if (!canSleep) {
-                Log.farm("家庭任务🏠去睡觉#当前无需睡觉或不在可睡时间段，跳过")
-                return
-            }
-
-            val sleepRes = JSONObject(AntFarmRpcCall.sleep(groupId))
-            if (ResChecker.checkRes(TAG, sleepRes)) {
-                Log.farm("家庭任务🏠去睡觉🛌")
-                Status.animalSleep()
-                Status.setFlagToday(StatusFlags.FLAG_FARM_FAMILY_SLEEP_TOGETHER)
-                return
-            }
-
-            // 某些“已在睡觉”等状态属于静默失败，也视为完成，避免反复触发
-            val memo = sleepRes.optString("memo")
-            val resultDesc = sleepRes.optString("resultDesc")
-            if (memo.contains("睡觉") || resultDesc.contains("睡觉")) {
-                Log.farm("家庭任务🏠去睡觉#可能已在睡觉：${resultDesc.ifBlank { memo }}")
-                Status.animalSleep()
-                Status.setFlagToday(StatusFlags.FLAG_FARM_FAMILY_SLEEP_TOGETHER)
-                return
-            }
-
-            Log.error(TAG, "家庭任务🏠去睡觉失败: ${resultDesc.ifBlank { memo.ifBlank { sleepRes.toString() } }}")
-        } catch (t: Throwable) {
-            Log.printStackTrace(TAG, "familySleepTogether err:", t)
+            Log.printStackTrace(TAG, "familyFeedFriendAnimal err:", t)
         }
     }
 
@@ -686,7 +679,11 @@ data object AntFarmFamily {
      * @param familyInteractActions 互动功能列表
      * @param familyUserIds 家庭成员列表
      */
-    private fun familyEatTogether(eatTogetherConfig: JSONObject, familyInteractActions: JSONArray, familyUserIds: MutableList<String>) {
+    private fun familyEatTogether(
+        eatTogetherConfig: JSONObject,
+        familyInteractActions: JSONArray,
+        familyUserIds: MutableList<String>,
+    ) {
         try {
             var isEat = false
             val periodItemList = eatTogetherConfig.optJSONArray("periodItemList")
@@ -694,35 +691,35 @@ data object AntFarmFamily {
                 Log.error(TAG, "美食不足,无法请客,请检查小鸡厨房")
                 return
             }
-            if (familyInteractActions.length() > 0) {
-                for (i in 0..<familyInteractActions.length()) {
-                    val familyInteractAction = familyInteractActions.getJSONObject(i)
-                    if ("EatTogether" == familyInteractAction.optString("familyInteractType")) {
-                        val endTime = familyInteractAction.optLong("interactEndTime", 0)
-                        val gaptime = endTime - System.currentTimeMillis()
-                        Log.farm("正在吃..${formatDuration(gaptime)} 吃完")
-                        return
-                    }
+            var periodName = ""
+            var periodStart = 0L
+            val now = System.currentTimeMillis()
+            var nextStart = Long.MAX_VALUE
+            for (i in 0..<periodItemList.length()) {
+                val item = periodItemList.getJSONObject(i)
+                val startHour = item.optInt("startHour", -1)
+                val startMinute = item.optInt("startMinute", -1)
+                val endHour = item.optInt("endHour", -1)
+                val endMinute = item.optInt("endMinute", -1)
+                if (startHour !in 0..23 || endHour !in 0..23 || startMinute !in 0..59 || endMinute !in 0..59) continue
+                val startTime = farmTimeToday(startHour, startMinute)
+                val endTime = farmTimeToday(endHour, endMinute)
+                if (endTime <= startTime) continue
+                nextStart = minOf(nextStart, if (startTime > now) startTime else startTime + 86400000L)
+                if (now >= startTime && now < endTime) {
+                    periodName = item.optString("periodName")
+                    periodStart = startTime
+                    isEat = true
                 }
             }
-            var periodName = ""
-            val currentTime = Calendar.getInstance()
-            for (i in 0..<periodItemList.length()) {
-                val periodItem = periodItemList.getJSONObject(i)
-                val startHour = periodItem.optInt("startHour")
-                val startMinute = periodItem.optInt("startMinute")
-                val endHour = periodItem.optInt("endHour")
-                val endMinute = periodItem.optInt("endMinute")
-                val startTime = Calendar.getInstance()
-                startTime.set(Calendar.HOUR_OF_DAY, startHour)
-                startTime.set(Calendar.MINUTE, startMinute)
-                val endTime = Calendar.getInstance()
-                endTime.set(Calendar.HOUR_OF_DAY, endHour)
-                endTime.set(Calendar.MINUTE, endMinute)
-                if (currentTime.after(startTime) && currentTime.before(endTime)) {
-                    periodName = periodItem.optString("periodName")
-                    isEat = true
-                    break
+            if (nextStart != Long.MAX_VALUE) AntFarm.instance?.deferFarmWork("meal", nextStart)
+            val mealFlag = "antFarm::familyMeal::$groupId::$periodStart"
+            if (AntFarm.instance?.farmWorkAttempted?.add("meal") == false || Status.hasFlagToday(mealFlag)) return
+            for (i in 0 until familyInteractActions.length()) {
+                val action = familyInteractActions.optJSONObject(i) ?: continue
+                if (action.optString("familyInteractType") == "EatTogether" && action.optLong("interactEndTime") > now) {
+                    Log.farm("家庭正在共同用餐，等待下一餐段")
+                    return
                 }
             }
             if (!isEat) {
@@ -738,14 +735,25 @@ data object AntFarmFamily {
                 Log.farm("查询最近的几份美食为空,无法请客")
                 return
             }
-            val jo = JSONObject(AntFarmRpcCall.familyEatTogether(groupId, familyUserIds.toJSONArray(), array))
+            val jo = JSONObject(AntFarmRpcCall.familyEatTogether(groupId, JSONArray(familyUserIds), array))
+            AntFarm.instance?.specialFoodCuisineSnapshot = null
             if (ResChecker.checkRes(TAG, jo)) {
                 Log.farm("家庭任务🏠请客" + periodName + "#消耗美食" + familyUserIds.size + "份（最近美食库存与特殊食品/补蛋共用）")
                 GlobalThreadPools.sleepCompat(500L)
                 syncFamilyStatusIntimacy(groupId)
+                val after = JSONObject(AntFarmRpcCall.enterFamily())
+                val actions = after.optJSONArray("familyInteractActions")
+                if (ResChecker.checkRes(TAG, after) && actions != null && (0 until actions.length()).any { index ->
+                    val action = actions.optJSONObject(index)
+                    action?.optString("familyInteractType") == "EatTogether" && action.optLong("interactEndTime") > now
+                }) {
+                    Status.setFlagToday(mealFlag)
+                } else {
+                    Log.farm("家庭请客响应成功但用餐状态未确认，保留待办")
+                }
             }
         } catch (t: Throwable) {
-            Log.printStackTrace(TAG, "familyEatTogether err:",t)
+            Log.printStackTrace(TAG, "familyEatTogether err:", t)
         }
     }
 
@@ -792,15 +800,8 @@ data object AntFarmFamily {
                 return
             }
 
-            val treadMillJo = queryFamilyTreadMillState()
-            val currentMemberState = treadMillJo?.optJSONArray("familyMemberInfoList")
-                ?.let { memberList ->
-                    (0 until memberList.length())
-                        .mapNotNull { memberList.optJSONObject(it) }
-                        .firstOrNull {
-                            it.optBoolean("currentUser", false) || it.optString("userId") == currentUid
-                        }
-                }
+            val currentMemberState =
+                findCurrentFamilyMemberState(queryFamilyTreadMillState(), currentUid)
             if (currentMemberState?.optBoolean("alreadyDonate", false) == true) {
                 Status.exchangeToday(currentUid)
                 Log.farm("家庭任务🏠捐步做公益#家庭页显示今日已捐步，跳过")
@@ -838,26 +839,27 @@ data object AntFarmFamily {
             val donateHomeResponse = AntSportsRpcCall.donateWalkHome(produceQuantity)
             val donateHomeJo = JSONObject(donateHomeResponse)
             if (!donateHomeJo.optBoolean("isSuccess", false)) {
-                if (donateHomeResponse.contains("已捐步")) {
-                    Status.exchangeToday(currentUid)
-                    Log.farm("家庭任务🏠捐步做公益#今日已捐步，跳过")
-                } else {
-                    Log.farm("家庭任务🏠捐步做公益失败: ${donateHomeJo.optString("resultDesc", donateHomeResponse)}")
-                }
+                Log.farm("家庭任务🏠捐步做公益失败: ${donateHomeJo.optString("resultDesc", donateHomeResponse)}")
                 return
             }
 
-            val walkDonateHomeModel = donateHomeJo.optJSONObject("walkDonateHomeModel") ?: return
+            val walkDonateHomeModel =
+                donateHomeJo.optJSONObject("walkDonateHomeModel") ?: run {
+                    Log.farm("家庭任务🏠捐步做公益#donateWalkHome 返回缺少 walkDonateHomeModel，未确认")
+                    return
+                }
             val walkUserInfoModel = walkDonateHomeModel.optJSONObject("walkUserInfoModel")
             if (walkUserInfoModel == null || !walkUserInfoModel.has("exchangeFlag")) {
-                Status.exchangeToday(currentUid)
+                Log.farm("家庭任务🏠捐步做公益#donateWalkHome 返回缺少 exchangeFlag，未确认")
                 return
             }
 
             val donateToken = walkDonateHomeModel.optString("donateToken")
-            val activityId = walkDonateHomeModel.optJSONObject("walkCharityActivityModel")
-                ?.optString("activityId")
-                .orEmpty()
+            val activityId =
+                walkDonateHomeModel
+                    .optJSONObject("walkCharityActivityModel")
+                    ?.optString("activityId")
+                    .orEmpty()
             if (donateToken.isBlank() || activityId.isBlank()) {
                 Log.farm("家庭任务🏠捐步做公益#缺少 donateToken 或 activityId，跳过")
                 return
@@ -869,15 +871,15 @@ data object AntFarmFamily {
                 val donateExchangeResultModel = exchangeJo.optJSONObject("donateExchangeResultModel")
                 val userCount = donateExchangeResultModel?.optInt("userCount", produceQuantity) ?: produceQuantity
                 val amount = donateExchangeResultModel?.optJSONObject("userAmount")?.optDouble("amount", 0.0) ?: 0.0
-                Log.farm("家庭任务🏠捐步做公益🚶[${userCount}步]#兑换${amount}元公益金")
-                Status.exchangeToday(currentUid)
-                syncFamilyStatusIntimacy(groupId)
-                return
-            }
-
-            if (exchangeResponse.contains("已捐步") || exchangeJo.optString("resultDesc").contains("已捐步")) {
-                Status.exchangeToday(currentUid)
-                Log.farm("家庭任务🏠捐步做公益#今日已捐步")
+                Log.farm("家庭任务🏠捐步做公益🚶[${userCount}步]#兑换已提交${amount}元公益金")
+                val updatedMemberState =
+                    findCurrentFamilyMemberState(queryFamilyTreadMillState(), currentUid)
+                if (updatedMemberState?.optBoolean("alreadyDonate", false) == true) {
+                    Status.exchangeToday(currentUid)
+                    syncFamilyStatusIntimacy(groupId)
+                } else {
+                    Log.farm("家庭任务🏠捐步做公益#兑换已提交但家庭状态未确认")
+                }
                 return
             }
 
@@ -906,24 +908,91 @@ data object AntFarmFamily {
     }
 
     /**
-     * 查询最近的几份美食
-     * @param queryNum 查询数量
+     * 从服务端当前可选库存中构造恰好满足请客人数的菜品明细。
+     * 保留服务端返回的菜品标识及其余字段，避免把整份库存或本地猜测的菜品提交给请客接口。
      */
     fun queryRecentFarmFood(queryNum: Int): JSONArray? {
+        if (queryNum <= 0) {
+            return null
+        }
         try {
-            val jo = JSONObject(AntFarmRpcCall.queryRecentFarmFood(queryNum))
-            if (!ResChecker.checkRes(TAG, jo)) {
+            val preferStock = AntFarm.instance?.specialFoodSelection?.value == 1
+            var pageNo = 1
+            val cuisines = JSONArray()
+            do {
+                val jo = JSONObject(AntFarmRpcCall.queryRecentFarmFood(queryNum, if (preferStock) pageNo else null))
+                if (!ResChecker.checkRes(TAG, jo)) {
+                    Log.error(TAG, "家庭美食库存查询失败 pageNo=$pageNo raw=$jo")
+                    return null
+                }
+                val page = jo.optJSONArray("cuisines") ?: return null
+                for (index in 0 until page.length()) cuisines.put(page.getJSONObject(index))
+                if (!preferStock || !jo.optBoolean("hasMore", false)) break
+                if (page.length() == 0) {
+                    Log.error(TAG, "家庭美食分页为空但仍有后续页 pageNo=$pageNo raw=$jo")
+                    return null
+                }
+                pageNo++
+            } while (!ApplicationHookConstants.isOffline())
+            val candidates =
+                buildList {
+                    for (i in 0 until cuisines.length()) {
+                        val cuisine = cuisines.optJSONObject(i) ?: continue
+                        val cuisineId =
+                            sequenceOf(
+                                cuisine.optString("cuisineId"),
+                                cuisine.optString("cuisineNo"),
+                                cuisine.optString("id"),
+                            ).firstOrNull { it.isNotBlank() } ?: continue
+                        val availableCount = cuisine.optInt("count", 0)
+                        if (availableCount <= 0) {
+                            continue
+                        }
+                        add(
+                            FamilyCuisineCandidate(
+                                cuisine = cuisine,
+                                cuisineId = cuisineId,
+                                availableCount = availableCount,
+                                // 仅使用 useFarmFood 回查已学习的收益；未知收益不按零进度猜测。
+                                knownEggProduce = AntFarm.instance?.getKnownSpecialFoodProduce(cuisineId),
+                            ),
+                        )
+                    }
+                }
+            val totalAvailableCount = candidates.sumOf { it.availableCount }
+            if (totalAvailableCount < queryNum) {
+                Log.farm("家庭任务🏠请客#服务端可选美食库存不足，需要${queryNum}份，缺少${queryNum - totalAvailableCount}份")
                 return null
             }
-            val cuisines = jo.getJSONArray("cuisines")
-            var count = 0
-            for (i in 0..<cuisines.length()) {
-                val cuisine = cuisines.getJSONObject(i)
-                count += cuisine.optInt("count")
+
+            val candidatesInPriority = if (preferStock) {
+                candidates.sortedWith(compareByDescending<FamilyCuisineCandidate> { it.availableCount }.thenBy { it.cuisineId })
+            } else {
+                candidates.sortedWith(
+                    compareByDescending<FamilyCuisineCandidate> { it.availableCount }
+                        .thenBy { it.knownEggProduce ?: Double.POSITIVE_INFINITY }
+                        .thenBy { it.cuisineId },
+                )
             }
-            if (cuisines != null && queryNum <= count) {
-                return cuisines
+            var remainingCount = queryNum
+            val selectedCuisines = JSONArray()
+            for (candidate in candidatesInPriority) {
+                if (remainingCount <= 0) {
+                    break
+                }
+                val selectedCount = min(candidate.availableCount, remainingCount)
+                selectedCuisines.put(
+                    JSONObject(candidate.cuisine.toString()).put("count", selectedCount),
+                )
+                remainingCount -= selectedCount
             }
+            if (remainingCount == 0) {
+                if (selectedCuisines.length() > 1) {
+                    Log.farm("家庭任务🏠请客#按库存与已知产蛋进度组合${selectedCuisines.length()}种美食")
+                }
+                return selectedCuisines
+            }
+            Log.farm("家庭任务🏠请客#未能构造足量美食组合，需要${queryNum}份，缺少${remainingCount}份")
         } catch (t: Throwable) {
             Log.printStackTrace(TAG, "queryRecentFarmFood err:", t)
         }
@@ -970,18 +1039,20 @@ data object AntFarmFamily {
         try {
             // 1. 时间窗口控制：仅允许在「早安时间段」内自动发送（06:00 ~ 10:00）
             val now = Calendar.getInstance()
-            val startTime = Calendar.getInstance().apply {
-                set(Calendar.HOUR_OF_DAY, 6)
-                set(Calendar.MINUTE, 0)
-                set(Calendar.SECOND, 0)
-                set(Calendar.MILLISECOND, 0)
-            }
-            val endTime = Calendar.getInstance().apply {
-                set(Calendar.HOUR_OF_DAY, 10)
-                set(Calendar.MINUTE, 0)
-                set(Calendar.SECOND, 0)
-                set(Calendar.MILLISECOND, 0)
-            }
+            val startTime =
+                Calendar.getInstance().apply {
+                    set(Calendar.HOUR_OF_DAY, 6)
+                    set(Calendar.MINUTE, 0)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
+            val endTime =
+                Calendar.getInstance().apply {
+                    set(Calendar.HOUR_OF_DAY, 10)
+                    set(Calendar.MINUTE, 0)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
             if (now.before(startTime) || now.after(endTime)) {
                 Log.farm("家庭任务🏠道早安#当前时间不在 06:00-10:00，跳过")
                 return
@@ -1045,11 +1116,12 @@ data object AntFarmFamily {
                 return
             }
 
-            val userIds = JSONArray().apply {
-                for (userId in familyUserIds) {
-                    put(userId)
+            val userIds =
+                JSONArray().apply {
+                    for (userId in familyUserIds) {
+                        put(userId)
+                    }
                 }
-            }
 
             // 4. 确认 AI 隐私协议（OpenAIPrivatePolicy 抓包见看我.txt 中 deliverChickInfoVO.privatePolicyId）
             val resp0 = JSONObject(AntFarmRpcCall.OpenAIPrivatePolicy())
@@ -1076,19 +1148,20 @@ data object AntFarmFamily {
             val success = resp1.optBoolean("success", true)
 
             // 6. 调用 DeliverContentExpand，实际向 AI 请求生成完整早安文案
-            val resp2 = JSONObject(
-                AntFarmRpcCall.deliverContentExpand(
-                    ariverRpcTraceId,
-                    eventId,
-                    eventName,
-                    memo,
-                    resultCode,
-                    sceneId,
-                    sceneName,
-                    success,
-                    userIds
+            val resp2 =
+                JSONObject(
+                    AntFarmRpcCall.deliverContentExpand(
+                        ariverRpcTraceId,
+                        eventId,
+                        eventName,
+                        memo,
+                        resultCode,
+                        sceneId,
+                        sceneName,
+                        success,
+                        userIds,
+                    ),
                 )
-            )
             if (!ResChecker.checkRes(TAG, resp2)) {
                 Log.error(TAG, "家庭任务🏠道早安#DeliverContentExpand 调用失败")
                 return
@@ -1098,17 +1171,18 @@ data object AntFarmFamily {
 
             // 7. 使用 deliverId 再次确认扩展内容，得到最终的早安文案
             val resp3 = JSONObject(AntFarmRpcCall.QueryExpandContent(deliverId))
-            val content = if (ResChecker.checkRes(TAG, resp3)) {
-                extractGreetingContent(resp3)
-            } else {
-                val fallbackContent = extractGreetingContent(resp2)
-                if (fallbackContent.isBlank()) {
-                    Log.error(TAG, "家庭任务🏠道早安#QueryExpandContent 调用失败")
-                    return
+            val content =
+                if (ResChecker.checkRes(TAG, resp3)) {
+                    extractGreetingContent(resp3)
+                } else {
+                    val fallbackContent = extractGreetingContent(resp2)
+                    if (fallbackContent.isBlank()) {
+                        Log.error(TAG, "家庭任务🏠道早安#QueryExpandContent 调用失败")
+                        return
+                    }
+                    Log.farm("家庭任务🏠道早安#QueryExpandContent 调用失败，已回退到 DeliverContentExpand 文案")
+                    fallbackContent
                 }
-                Log.farm("家庭任务🏠道早安#QueryExpandContent 调用失败，已回退到 DeliverContentExpand 文案")
-                fallbackContent
-            }
             if (content.isBlank()) {
                 Log.error(TAG, "家庭任务🏠道早安#未获取到可发送文案，跳过")
                 return
@@ -1127,54 +1201,115 @@ data object AntFarmFamily {
 
     /**
      * 好友分享家庭
-     * @param familyUserIds 好友列表
-     * @param notInviteList 不邀请列表
+     * @param familyUserIds 当前家庭成员列表
+     * @param familyShareList 好友分享规则
+     * @param familyShareMode 规则解析结果的动作模式
      */
-    private fun familyShareToFriends(familyUserIds: MutableList<String>, notInviteList: FriendSelectionModelField) {
+    private fun familyShareToFriends(
+        familyUserIds: MutableList<String>,
+        familyShareList: FriendSelectionModelField,
+        familyShareMode: Int,
+    ) {
         try {
             if (Status.hasFlagToday(StatusFlags.FLAG_FARM_FAMILY_SHARE_TO_FRIENDS)) {
                 return
             }
-
-            val familyValue = notInviteList.resolvedIds()
-            val allUser = FriendSelectionResolver.availableFriendOptions()
-
-            if (allUser.isEmpty()) {
-                Log.error(TAG, "allUser is empty")
+            if (familyUserIds.size >= FAMILY_MEMBER_LIMIT) {
+                Log.farm(
+                    "家庭任务🏠分享好友跳过: FAMILY_MEMBER_LIMIT_REACHED " +
+                        "familyMemberCount=${familyUserIds.size}",
+                )
                 return
             }
 
-            // 打乱顺序，实现随机选取
-            val shuffledUsers = allUser.shuffled()
+            val configuredIds = familyShareList.resolvedIds()
+            val normalizedMode =
+                if (familyShareMode == FamilyShareMode.DONT_INVITE_SELECTED) {
+                    FamilyShareMode.DONT_INVITE_SELECTED
+                } else {
+                    FamilyShareMode.INVITE_SELECTED
+                }
+            val modeName =
+                if (normalizedMode == FamilyShareMode.DONT_INVITE_SELECTED) {
+                    "选中不邀请"
+                } else {
+                    "选中邀请"
+                }
+            val candidateIds =
+                if (normalizedMode == FamilyShareMode.INVITE_SELECTED) {
+                    if (configuredIds.isEmpty()) {
+                        Log.farm("家庭任务🏠分享好友跳过: NO_CONFIGURED_INVITE_FRIENDS mode=$modeName")
+                        return
+                    }
+                    configuredIds.toList()
+                } else {
+                    var allUsers = FriendSelectionResolver.availableFriendOptions()
+                    if (allUsers.isEmpty()) {
+                        FriendRepository.mergeFromUserMap()
+                        allUsers = FriendSelectionResolver.availableFriendOptions()
+                    }
+                    if (allUsers.isEmpty()) {
+                        Log.farm(
+                            "家庭任务🏠分享好友延后: NO_AVAILABLE_MUTUAL_FRIENDS " +
+                                "mode=$modeName familyMemberCount=${familyUserIds.size} excludedCount=${configuredIds.size}",
+                        )
+                        return
+                    }
+                    allUsers.map { it.id }.filterNot(configuredIds::contains)
+                }
+            val familyMemberIds =
+                familyUserIds
+                    .mapNotNull { it.trim().takeIf { userId -> userId.isNotEmpty() } }
+                    .toSet()
+            val inviteUserIds =
+                candidateIds
+                    .asSequence()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .filterNot(familyMemberIds::contains)
+                    .distinct()
+                    .toList()
+                    .shuffled()
+                    .take(6)
+
+            if (inviteUserIds.isEmpty()) {
+                Log.farm(
+                    "家庭任务🏠分享好友延后: NO_ELIGIBLE_FAMILY_FRIENDS " +
+                        "mode=$modeName configuredCount=${configuredIds.size} " +
+                        "candidateCount=${candidateIds.size} familyMemberCount=${familyMemberIds.size}",
+                )
+                return
+            }
 
             val inviteList = JSONArray()
-            for (u in shuffledUsers) {
-                if (!familyUserIds.contains(u.id) && !familyValue.contains(u.id)) {
-                    inviteList.put(u.id)
-                    if (inviteList.length() >= 6) {
-                        break
-                    }
-                }
-            }
-
-            if (inviteList.length() == 0) {
-                Log.error(TAG, "没有符合分享条件的好友")
-                return
-            }
-
-            Log.farm("inviteList: $inviteList")
+            inviteUserIds.forEach(inviteList::put)
+            Log.farm(
+                "家庭任务🏠分享好友提交: mode=$modeName configuredCount=${configuredIds.size} " +
+                    "inviteCount=${inviteList.length()}",
+            )
 
             val jo = JSONObject(AntFarmRpcCall.inviteFriendVisitFamily(inviteList))
-            if (ResChecker.checkRes(TAG, jo)) {
-                Log.farm("家庭任务🏠分享好友")
-                Status.setFlagToday(StatusFlags.FLAG_FARM_FAMILY_SHARE_TO_FRIENDS)
-                syncFamilyStatusIntimacy(groupId)
+            when (AntFarmRpcCall.confirmFamilyInviteVisitOutcome(jo)) {
+                AntFarmRpcCall.FamilyInviteVisitOutcome.SUBMITTED -> {
+                    Log.farm("家庭任务🏠分享好友")
+                    Status.setFlagToday(StatusFlags.FLAG_FARM_FAMILY_SHARE_TO_FRIENDS)
+                    syncFamilyStatusIntimacy(groupId)
+                }
+
+                AntFarmRpcCall.FamilyInviteVisitOutcome.ALREADY_COMPLETED_CONFIRMED -> {
+                    Log.farm("家庭任务🏠分享好友已完成，家庭任务快照已确认")
+                    Status.setFlagToday(StatusFlags.FLAG_FARM_FAMILY_SHARE_TO_FRIENDS)
+                    syncFamilyStatusIntimacy(groupId)
+                }
+
+                AntFarmRpcCall.FamilyInviteVisitOutcome.RETRY_LATER -> {
+                    Log.farm("家庭任务🏠分享好友未确认完成，保留后续重试: $jo")
+                }
             }
         } catch (t: Throwable) {
             Log.printStackTrace(TAG, "familyShareToFriends err:", t)
         }
     }
-
 
     /**
      * 自动购买家具
@@ -1189,19 +1324,47 @@ data object AntFarmFamily {
 
             val activityId = familyJo.optString("decorationCoinActivityId", "20250808")
             Log.farm("[家庭装扮] 当前活动 ID: $activityId")
+            val todayFlag = StatusFlags.FLAG_FARM_FAMILY_DECORATION_CHECK_DONE_PREFIX + activityId
+            if (Status.hasFlagToday(todayFlag)) {
+                Log.farm("[家庭装扮] 今日已完成活动检查，跳过 activityId=$activityId")
+                return
+            }
 
             // 分类列表
-            val labelTypes = listOf(
-                "", "recentlyAdded", "sofa", "seat2", "seat4", "seat5", "seat3",
-                "curtain", "table", "carpet", "mattress", "bed3", "bed4",
-                "bed5", "ceiling", "windowView", "firstFloor", "firstWall", "secondFloor",
-                "secondWall", "leftWallDecoration", "rightWallDecoration", "treadmill", "slide"
-            )
+            val labelTypes =
+                listOf(
+                    "",
+                    "recentlyAdded",
+                    "sofa",
+                    "seat2",
+                    "seat4",
+                    "seat5",
+                    "seat3",
+                    "curtain",
+                    "table",
+                    "carpet",
+                    "mattress",
+                    "bed3",
+                    "bed4",
+                    "bed5",
+                    "ceiling",
+                    "windowView",
+                    "firstFloor",
+                    "firstWall",
+                    "secondFloor",
+                    "secondWall",
+                    "leftWallDecoration",
+                    "rightWallDecoration",
+                    "treadmill",
+                    "slide",
+                )
 
             var currentBalance = 0
             val purchasedDecorationKeys = LinkedHashSet<String>()
+            var scanCompleted = true
+            var purchasedCount = 0
 
-            for (label in labelTypes) {
+            labelLoop@ for (label in labelTypes) {
                 var startIndex = 0
                 var hasMore = true
                 Log.farm("[家庭装扮] 正在检查分类: ${if (label.isEmpty()) "新品" else label}")
@@ -1209,25 +1372,47 @@ data object AntFarmFamily {
                 while (hasMore) {
                     val itemListRes = AntFarmRpcCall.getFitmentItemList(activityId, 10, label, startIndex)
                     val itemJo = JSONObject(itemListRes)
-                    if (!ResChecker.checkRes(TAG, itemJo)) break
+                    if (!ResChecker.checkRes(TAG, itemJo)) {
+                        scanCompleted = false
+                        break@labelLoop
+                    }
 
                     // 解析实时装修金余额
                     val accountInfo = itemJo.optJSONObject("mallAccountInfoVO")
-                    currentBalance = accountInfo?.optJSONObject("holdingCount")?.optInt("cent") ?: 0
+                    val holdingCount = accountInfo?.optJSONObject("holdingCount")
+                    if (holdingCount == null || !holdingCount.has("cent")) {
+                        scanCompleted = false
+                        Log.error(TAG, "[家庭装扮] 缺少装修金余额字段，今日不落完成标识")
+                        break@labelLoop
+                    }
+                    currentBalance = holdingCount.optInt("cent")
 
                     val items = itemJo.optJSONArray("itemInfoVOList")
-                    if (items == null || items.length() == 0) break
+                    val hasMoreField = itemJo.optBoolean("hasMore", false)
+                    if (items == null || items.length() == 0 && hasMoreField) {
+                        scanCompleted = false
+                        Log.error(TAG, "[家庭装扮] 商品列表缺失或非末页为空: label=$label startIndex=$startIndex count=${items?.length()} hasMore=$hasMoreField，今日不落完成标识")
+                        break@labelLoop
+                    }
+                    if (items.length() == 0) break
 
                     for (j in 0 until items.length()) {
                         val item = items.getJSONObject(j)
                         val spuId = item.getString("spuId")
-                        val spuName = item.getString("spuName")
-                        val price = item.optJSONObject("minPrice")?.optInt("cent") ?: 9999999
+                        val spuName = item.optString("spuName", spuId)
 
                         val itemStatusList = item.optJSONArray("itemStatusList")
                         val canBuy = itemStatusList == null || itemStatusList.length() == 0
+                        val minPrice = item.optJSONObject("minPrice")
+                        val price = minPrice?.takeIf { it.has("cent") }?.optInt("cent")
 
-                        if (canBuy && currentBalance >= price) {
+                        if (canBuy && price == null) {
+                            scanCompleted = false
+                            Log.error(TAG, "[家庭装扮] 未拥有家具[$spuName]缺少价格字段，今日不落完成标识")
+                            break@labelLoop
+                        }
+
+                        if (canBuy && price != null && currentBalance >= price) {
                             val skuList = item.optJSONArray("skuModelList")
                             if (skuList != null && skuList.length() > 0) {
                                 val skuId = skuList.getJSONObject(0).getString("skuId")
@@ -1242,36 +1427,93 @@ data object AntFarmFamily {
                                 val exchangeJo = JSONObject(exchangeRes)
 
                                 if (ResChecker.checkRes(TAG, exchangeJo)) {
-                                    Log.farm("家庭装扮💸#成功购买[$spuName]#消耗[${price/100}装修金]")
+                                    val confirmation = confirmFamilyDecorationExchange(
+                                        activityId = activityId,
+                                        label = label,
+                                        startIndex = startIndex,
+                                        spuId = spuId,
+                                        balanceBefore = currentBalance,
+                                        price = price,
+                                    )
+                                    if (!confirmation.confirmed) {
+                                        scanCompleted = false
+                                        Log.error(TAG, "家庭装扮[$spuName]购买成功但服务端回查未确认，今日不落完成标识")
+                                        break@labelLoop
+                                    }
+                                    Log.farm("家庭装扮💸#成功购买[$spuName]#消耗[${price / 100}装修金]")
                                     purchasedDecorationKeys.add(exchangeKey)
-                                    currentBalance -= price
+                                    purchasedCount++
+                                    currentBalance = confirmation.balanceCent ?: (currentBalance - price)
                                 }
                                 GlobalThreadPools.sleepCompat(2000)
+                            } else {
+                                scanCompleted = false
+                                Log.error(TAG, "[家庭装扮] 未拥有家具[$spuName]缺少skuId，今日不落完成标识")
+                                break@labelLoop
                             }
                         }
                     }
 
-                    val nextIndex = itemJo.optInt("nextStartIndex", 0)
-                    val hasMoreField = itemJo.optBoolean("hasMore", false)
-                    if (hasMoreField && nextIndex > startIndex) {
+                    val nextIndex = itemJo.optInt("nextStartIndex", -1)
+                    if (hasMoreField) {
+                        if (nextIndex <= startIndex) {
+                            scanCompleted = false
+                            Log.error(TAG, "[家庭装扮] 分页未前进: label=$label startIndex=$startIndex nextStartIndex=$nextIndex hasMore=$hasMoreField，今日不落完成标识")
+                            break@labelLoop
+                        }
                         startIndex = nextIndex
                     } else {
                         hasMore = false
                     }
                 }
-
-                // 当处理完 seat3 分类后，如果装修金 < 49，终止后续更贵的分类的遍历
-                if (currentBalance < 4900 && label == "seat3") {
-                    Log.farm("[家庭装扮] 装修金不足 49 且已完成 seat3 遍历，终止任务")
-                    break
-                }
+            }
+            if (scanCompleted) {
+                Status.setFlagToday(todayFlag)
             }
             Log.farm("[家庭装扮] 全量检查任务执行完毕")
+            if (scanCompleted) {
+                Log.farm("[家庭装扮] 今日检查已确认完成，购买${purchasedCount}件，剩余装修金${currentBalance / 100}")
+            }
         } catch (t: Throwable) {
             Log.printStackTrace(TAG, "autoExchangeFamilyDecoration 失败", t)
         }
     }
 
+    private fun confirmFamilyDecorationExchange(
+        activityId: String,
+        label: String,
+        startIndex: Int,
+        spuId: String,
+        balanceBefore: Int,
+        price: Int,
+    ): DecorationExchangeConfirmation {
+        return try {
+            GlobalThreadPools.sleepCompat(500)
+            val response = JSONObject(AntFarmRpcCall.getFitmentItemList(activityId, 10, label, startIndex))
+            if (!ResChecker.checkRes(TAG, response)) {
+                return DecorationExchangeConfirmation(false, null)
+            }
+            val balance = response.optJSONObject("mallAccountInfoVO")
+                ?.optJSONObject("holdingCount")
+                ?.optInt("cent")
+            val itemList = response.optJSONArray("itemInfoVOList")
+            var statusConfirmed = false
+            if (itemList != null) {
+                for (index in 0 until itemList.length()) {
+                    val item = itemList.optJSONObject(index) ?: continue
+                    if (item.optString("spuId") != spuId) continue
+                    val itemStatusList = item.optJSONArray("itemStatusList")
+                    statusConfirmed = itemStatusList != null && itemStatusList.length() > 0
+                    break
+                }
+            }
+            val balanceConfirmed = price > 0 && balance != null && balance <= balanceBefore - price
+            DecorationExchangeConfirmation(statusConfirmed || balanceConfirmed, balance)
+        } catch (t: Throwable) {
+            Log.printStackTrace(TAG, "confirmFamilyDecorationExchange 失败", t)
+            DecorationExchangeConfirmation(false, null)
+        }
+    }
 
     /**
      * 通用时间差格式化（自动区分过去/未来）
@@ -1281,14 +1523,15 @@ data object AntFarmFamily {
     fun formatDuration(diffMillis: Long): String {
         val absSeconds = abs(diffMillis) / 1000
 
-        val (value, unit) = when {
-            absSeconds < 60 -> Pair(absSeconds, "秒")
-            absSeconds < 3600 -> Pair(absSeconds / 60, "分钟")
-            absSeconds < 86400 -> Pair(absSeconds / 3600, "小时")
-            absSeconds < 2592000 -> Pair(absSeconds / 86400, "天")
-            absSeconds < 31536000 -> Pair(absSeconds / 2592000, "个月")
-            else -> Pair(absSeconds / 31536000, "年")
-        }
+        val (value, unit) =
+            when {
+                absSeconds < 60 -> Pair(absSeconds, "秒")
+                absSeconds < 3600 -> Pair(absSeconds / 60, "分钟")
+                absSeconds < 86400 -> Pair(absSeconds / 3600, "小时")
+                absSeconds < 2592000 -> Pair(absSeconds / 86400, "天")
+                absSeconds < 31536000 -> Pair(absSeconds / 2592000, "个月")
+                else -> Pair(absSeconds / 31536000, "年")
+            }
 
         return when {
             absSeconds < 1 -> "刚刚"

@@ -18,7 +18,6 @@ import java.io.File
 import java.nio.file.Path
 import java.nio.file.StandardWatchEventKinds
 import java.nio.file.WatchService
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
@@ -211,15 +210,17 @@ class UserDataStore(val uid: String, private val storageFile: File) {
         return File.createTempFile("${storageFile.name}.", ".tmp", parentDir)
     }
 
-    private fun saveToDisk() {
+    private fun saveToDisk(requirePersistence: Boolean = false) {
         var tempFile: File? = null
         try {
             tempFile = createWriteTempFile()
             mapper.writer(prettyPrinter).writeValue(tempFile, data)
+            if (requirePersistence) java.io.FileOutputStream(tempFile, true).use { it.fd.sync() }
             setWorldReadableWritable(tempFile)
             lastWriteTime.set(System.currentTimeMillis())
             var renameSuccess = tempFile.renameTo(storageFile)
             if (!renameSuccess) {
+                if (requirePersistence) throw java.io.IOException("Failed to atomically persist user data")
                 Log.w(tag, "renameTo failed, falling back to copy stream.")
                 try {
                     tempFile.copyTo(storageFile, overwrite = true)
@@ -234,6 +235,7 @@ class UserDataStore(val uid: String, private val storageFile: File) {
             }
         } catch (e: Exception) {
             Log.e(tag, "Failed to save config", e)
+            if (requirePersistence) throw e
         } finally {
             if (tempFile?.exists() == true) {
                 tempFile.delete()
@@ -267,7 +269,8 @@ class UserDataStore(val uid: String, private val storageFile: File) {
             try {
                 while (isActive) {
                     val key = try {
-                        watch.poll(1, TimeUnit.SECONDS) ?: continue
+                        // 由真实文件变更唤醒；shutdown() 会关闭 WatchService，因此 take() 不会阻塞销毁。
+                        watch.take()
                     } catch (_: Exception) { return@execute }
 
                     var shouldReload = false
@@ -297,6 +300,18 @@ class UserDataStore(val uid: String, private val storageFile: File) {
         forceLoadFromDisk()
         data[key] = value
         saveToDisk()
+    }
+
+    /** 消费动作的待确认记录必须落盘成功，调用方才能提交请求。 */
+    fun put(key: String, value: Any, requirePersistence: Boolean) = lock.write {
+        forceLoadFromDisk()
+        val previous = data.put(key, value)
+        try {
+            saveToDisk(requirePersistence)
+        } catch (e: Exception) {
+            if (previous == null) data.remove(key) else data[key] = previous
+            throw e
+        }
     }
 
     fun remove(key: String) = lock.write {

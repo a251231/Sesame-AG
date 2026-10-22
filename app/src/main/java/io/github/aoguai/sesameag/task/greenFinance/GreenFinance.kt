@@ -606,6 +606,9 @@ class GreenFinance : ModelTask() {
                 }
             }
 
+            override fun isUnresolvedWhenSkipped(item: TaskFlowItem): Boolean =
+                mapPhase(item) != TaskFlowPhase.TERMINAL && !super<TaskFlowAdapter>.isBlacklisted(item)
+
             override fun receive(item: TaskFlowItem): TaskFlowActionResult {
                 return triggerTaskStage(item, "receive", TaskFlowAction.RECEIVE)
             }
@@ -647,13 +650,6 @@ class GreenFinance : ModelTask() {
 
             override fun onAllTasksDone(snapshot: TaskFlowSnapshot) {
                 logInfo("$flowName[任务列表已处理完成：${snapshot.completedTasks}/${snapshot.totalTasks}]")
-            }
-
-            override fun onQueryFailed(response: JSONObject) {
-                Log.runtime(
-                    "$tag.doTask.taskQuery",
-                    response.optString("resultDesc").ifBlank { response.toString() }
-                )
             }
 
             override fun logInfo(message: String) {

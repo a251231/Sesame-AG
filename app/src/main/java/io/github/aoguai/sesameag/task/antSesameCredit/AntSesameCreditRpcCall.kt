@@ -102,6 +102,47 @@ object AntSesameCreditRpcCall {
         )
     }
 
+    @JvmStatic
+    fun queryAccomplishmentHome(tabCode: String? = null): String = RequestManager.requestString(
+        "com.antgroup.zmxy.zmcustprod.biz.rpc.creditidentity.api.CreditIdentityAchievementRpcManager.queryAccomplishmentHomeV2",
+        JSONArray().put(JSONObject().apply {
+            if (!tabCode.isNullOrBlank()) put("tabCode", tabCode)
+        }).toString(),
+    )
+
+    @JvmStatic
+    fun queryAccomplishmentDetail(medalSeriesCode: String): String = RequestManager.requestString(
+        "com.antgroup.zmxy.zmcustprod.biz.rpc.creditidentity.api.CreditIdentityAchievementRpcManager.enterAccomplishmentDetailV2",
+        JSONArray().put(JSONObject().put("medalSeriesCode", medalSeriesCode)).toString(),
+    )
+
+    @JvmStatic
+    fun claimAccomplishment(medalSeriesCode: String): String = RequestManager.requestString(
+        "com.antgroup.zmxy.zmcustprod.biz.rpc.creditidentity.api.CreditIdentityAchievementRpcManager.claimAccomplishmentV2",
+        JSONArray().put(JSONObject().put("medalSeriesCode", medalSeriesCode)).toString(),
+    )
+
+    @JvmStatic
+    fun queryPassageScenes(): String = RequestManager.requestString(
+        "com.antgroup.zmxy.zmcustprod.biz.rpc.creditidentity.api.CreditIdentityPassageRpcManager.queryPassageScenes",
+        """[{"queryVersion":"V3"}]""",
+    )
+
+    @JvmStatic
+    fun queryPassageActivationPanel(sceneCode: String): String = RequestManager.requestString(
+        "com.antgroup.zmxy.zmcustprod.biz.rpc.creditidentity.api.CreditIdentityPassageRpcManager.queryPassageActivationPanel",
+        JSONArray().put(JSONObject().put("sceneCode", sceneCode)).toString(),
+    )
+
+    @JvmStatic
+    fun activatePassage(sceneCode: String): String = RequestManager.requestString(
+        "com.antgroup.zmxy.zmcustprod.biz.rpc.creditidentity.api.CreditIdentityPassageRpcManager.activatePassage",
+        JSONArray().put(JSONObject().apply {
+            put("sceneCode", sceneCode)
+            put("requestId", System.currentTimeMillis().toString())
+        }).toString(),
+    )
+
     /**
      * 获取芝麻信用任务列表
      */
@@ -141,7 +182,8 @@ object AntSesameCreditRpcCall {
         taskTemplateId: String,
         bizType: String? = null,
         sceneCode: String? = null,
-        version: String? = null
+        version: String? = null,
+        changeRewardType: String? = null,
     ): String {
         val args = JSONObject().apply {
             put("actionType", "TO_COMPLETE")
@@ -155,6 +197,9 @@ object AntSesameCreditRpcCall {
             if (!version.isNullOrBlank()) {
                 put("version", version)
             }
+            if (!changeRewardType.isNullOrBlank()) {
+                put("changeRewardType", changeRewardType)
+            }
         }
         val resp = RequestManager.requestString(
             "com.antgroup.zmxy.zmmemberop.biz.rpc.creditaccumulate.CreditAccumulateStrategyRpcManager.taskFeedback",
@@ -162,6 +207,21 @@ object AntSesameCreditRpcCall {
             "zmmemberop", "taskFeedback", "CreditAccumulateStrategyRpcManager"
         )
         return resp
+    }
+
+    /**
+     * 芝麻租赁任务动作提交
+     */
+    @JvmStatic
+    fun submitSesameRentAction(): String {
+        val args = JSONObject()
+            .put("chInfo", "chInfo=ch_zmzltf__chsub_zmlrw")
+            .put("type", "actionSubmit")
+        return RequestManager.requestString(
+            "com.alipay.creditapollon.biz.rpc.api.rent.RentRpcService.actionSubmit",
+            JSONArray().put(args).toString(),
+            "creditapollon", "actionSubmit", "RentRpcService",
+        )
     }
 
     /**
@@ -220,17 +280,6 @@ object AntSesameCreditRpcCall {
             """[{"collectAll":false,"creditFeedbackId":"$creditFeedbackId","status":"UNCLAIMED"}]"""
         )
         return resp
-    }
-
-    /**
-     * 芝麻粒首页
-     */
-    @JvmStatic
-    fun queryPointHome(): String {
-        return RequestManager.requestString(
-            "com.antgroup.zmxy.zmmemberop.biz.rpc.PointHomeRpcManager.queryHome",
-            "[{}]"
-        )
     }
 
     /**
@@ -659,6 +708,49 @@ object AntSesameCreditRpcCall {
                 return RequestManager.requestString(
                     METHOD_ALCHEMY_QUERY_HOME,
                     "[{}]"
+                )
+            }
+
+            @JvmStatic
+            fun alchemyWithdrawPreConsult(): String {
+                return RequestManager.requestString(
+                    "com.antgroup.zmxy.zmmemberop.biz.rpc.AlchemyRpcManager.withdrawPreConsult",
+                    "[null]",
+                )
+            }
+
+            @JvmStatic
+            fun alchemyWithdraw(newUser: Boolean = false): String {
+                val requestData = JSONArray().put(JSONObject().put("newUser", newUser)).toString()
+                return RequestManager.requestString(
+                    "com.antgroup.zmxy.zmmemberop.biz.rpc.AlchemyRpcManager.withdraw",
+                    requestData,
+                )
+            }
+
+            @JvmStatic
+            fun alchemyQueryAvailableItems(): String {
+                val requestData = JSONArray().put(JSONObject().put("bizScene", "ALCHEMY")).toString()
+                return RequestManager.requestString(
+                    "com.antgroup.zmxy.zmmemberop.biz.rpc.ItemRpcManager.queryAvailableItems",
+                    requestData,
+                )
+            }
+
+            @JvmStatic
+            fun alchemyUseItem(
+                itemId: String,
+                itemType: String,
+            ): String {
+                val requestData =
+                    JSONArray().put(
+                        JSONObject()
+                            .put("itemId", itemId)
+                            .put("itemType", itemType),
+                    ).toString()
+                return RequestManager.requestString(
+                    "com.antgroup.zmxy.zmmemberop.biz.rpc.ItemRpcManager.useItem",
+                    requestData,
                 )
             }
 

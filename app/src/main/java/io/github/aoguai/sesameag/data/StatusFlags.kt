@@ -19,13 +19,12 @@ package io.github.aoguai.sesameag.data
  *
  * 使用约束：
  * - 只有成功闭环或明确业务终态才能落完成/止损标记。
- * - 完成态/止损态必须通过 Status.setFlagToday() 写入，以继承全局离线后的今日标识保护。
+ * - 完成态/止损态通常通过 Status.setFlagToday() 写入，以继承全局离线后的今日标识保护；需要在 offline 后记录的兑换风控止损态使用受控的 Status.setFlagTodayWhileOffline()。
  * - 计数态只记录进度、次数或触发槽，不应复用为“今日已完成/停止”的闭环标识。
  * - 参数错误、RPC 未验证、抓包不足不应伪装成完成态；需要保留日志上下文或进入待支持/补抓流程。
  * - 新增 flag 时优先使用“模块名::业务名::状态”的值格式；是否保留历史 key 由对应重构策略决定。
  */
 object StatusFlags {
-
     // ============================================================
     // 通用 / 调度
     // ============================================================
@@ -62,6 +61,12 @@ object StatusFlags {
     /** 森林 PK：今日已判定无需处理（未加入/赛季未开启），用于避免重复请求触发风控 */
     const val FLAG_ANTFOREST_PK_SKIP_TODAY: String = "AntForest::pkSkipToday"
 
+    /** 森林：今日是否已签到 */
+    const val FLAG_ANTFOREST_SIGN_DONE: String = "AntForest::signed"
+
+    /** 绿植浏览：服务端已确认当日任务完成 */
+    const val FLAG_FOREST_PLANT_BROWSE_DONE = "AntForest::plantBrowseDone"
+
     /** 森林 1V1 能量挑战赛：今日已查询并处理待领奖励 */
     const val FLAG_ANTFOREST_ENERGY_PVP_CHALLENGE_DONE: String = "AntForest::energyPvpChallengeDone"
 
@@ -77,11 +82,11 @@ object StatusFlags {
     /** 森林：打地鼠今日已执行 */
     const val FLAG_ANTFOREST_WHACK_MOLE_EXECUTED = "forest::whackMole::executed"
 
+    /** 当日选中的保护地 ID；0 表示合成后需要重新评估。 */
+    const val FLAG_ANTFOREST_PATROL_TARGET = "AntForest::patrolTarget"
+
     /** 森林：保护地巡护机会兑换今日已达上限 */
     const val FLAG_ANTFOREST_PATROL_CHANCE_EXCHANGE_LIMIT = "AntForest::exchangePatrolChanceLimit"
-
-    /** 森林：累计奖励按 sceneCode/taskType 维度记录今日已处理前缀 */
-    const val FLAG_ANTFOREST_DEFERRED_RIGHTS_HANDLED_PREFIX = "AntForest::deferredRightsHandled::"
 
     /** 森林：双击卡时间槽已消费到的索引 */
     const val FLAG_ANTFOREST_DOUBLE_CARD_TRIGGER_INDEX = "antForest::doubleCard::triggerIndex"
@@ -97,6 +102,7 @@ object StatusFlags {
 
     /** 森林抽抽乐：常规场景今日已完成 */
     const val FLAG_ANTFOREST_CHOUCHOULE_NORMAL_COMPLETED = "forest::chouChouLe::normal::completed"
+    const val FLAG_ANTFOREST_DAILY_DRESS = "forest::dailyDress"
 
     /** 森林抽抽乐：活动场景今日已完成 */
     const val FLAG_ANTFOREST_CHOUCHOULE_ACTIVITY_COMPLETED = "forest::chouChouLe::activity::completed"
@@ -107,11 +113,18 @@ object StatusFlags {
     /** 森林抽抽乐：动态场景完成标记后缀 */
     const val FLAG_ANTFOREST_CHOUCHOULE_COMPLETED_SUFFIX = "::completed"
 
-    /** 青春特权：今日已领取完成 */
-    const val FLAG_ANTFOREST_PRIVILEGE_RECEIVED = "youth_privilege_forest_received"
+    // ============================================================
+    // YouthPrivilege（青春特权）
+    // ============================================================
 
-    /** 青春特权：学生签到今日已处理 */
-    const val FLAG_ANTFOREST_PRIVILEGE_STUDENT_TASK = "youth_privilege_student_task"
+    /** 青春特权：森林道具已由服务端回查确认。 */
+    const val FLAG_YOUTH_PRIVILEGE_FOREST_PROPS_DONE = "YouthPrivilege::forestPropsDone"
+
+    /** 青春特权：签到已由服务端回查确认。 */
+    const val FLAG_YOUTH_PRIVILEGE_CHECK_IN_DONE = "YouthPrivilege::checkInDone"
+
+    /** 青春特权：今日任务列表已确认无可执行项。 */
+    const val FLAG_YOUTH_PRIVILEGE_TASKS_DONE = "YouthPrivilege::tasksDone"
 
     // ============================================================
     // AntMember（会员频道 / 积分）
@@ -120,11 +133,13 @@ object StatusFlags {
     /** 今日是否已处理「会员签到」 */
     const val FLAG_ANTMEMBER_MEMBER_SIGN_DONE: String = "AntMember::memberSignDone"
 
+    const val FLAG_ANTMEMBER_MEMBER_FLOATING_BALL_FAILED_TODAY = "AntMember::memberFloatingBallFailedToday"
+
     /** 今日会员任务已处理到无需继续刷新 */
     const val FLAG_ANTMEMBER_MEMBER_TASK_EMPTY_TODAY: String = "AntMember::memberTaskEmptyToday"
 
-    /** 今日会员任务因风控/离线止损，不再继续刷新 */
-    const val FLAG_ANTMEMBER_MEMBER_TASK_RISK_STOP_TODAY: String = "AntMember::memberTaskRiskStopToday"
+    /** RPC 今日硬阻塞停止标识；后缀为完整 RPC 方法名。 */
+    const val FLAG_RPC_DAILY_RISK_STOP_PREFIX: String = "Rpc::dailyRiskStop::"
 
     /** 会员积分权益兑换：今日已完成权益列表刷新/扫描 */
     const val FLAG_ANTMEMBER_MEMBER_BENEFIT_REFRESH_DONE: String = "memberBenefit::refresh"
@@ -135,14 +150,23 @@ object StatusFlags {
     /** 网商福利金：今日兑换列表已刷新并处理已勾选项 */
     const val FLAG_MYBANK_WELFARE_EXCHANGE_REFRESH_DONE: String = "MyBankWelfare::exchangeRefreshDone"
 
+    /** 网商福利金：今日任务中心已确认无可执行项 */
+    const val FLAG_MYBANK_WELFARE_TASKS_DONE: String = "MyBankWelfare::tasksDone"
+
     /** 今日游戏中心签到、平台任务、乐豆和赚现金签到是否已处理 */
     const val FLAG_ANTMEMBER_GAME_CENTER_DONE = "AntMember::gameCenterDone"
 
     /** 今日安心豆签到与守护者奖励是否已处理 */
     const val FLAG_ANTMEMBER_BEAN_SIGN_DONE = "AntMember::beanSignInDone"
 
+    /** 今日安心豆抽奖是否已处理 */
+    const val FLAG_ANTMEMBER_BEAN_DRAW_PRIZE_DONE = "AntMember::beanDrawPrizeDone"
+
     /** 今日蚂蚁保保障金是否已处理 */
     const val FLAG_ANTMEMBER_INSURED_GOLD_DONE = "AntMember::insuredGoldDone"
+
+    /** 蚂蚁保保障金：任务中心今日完成标记前缀 */
+    const val FLAG_ANTMEMBER_INSURED_TASK_CENTER_DONE_PREFIX = "AntMember::insuredTaskCenterDone::"
 
     /** 余额宝体验金：任务完成前缀 */
     const val FLAG_ANTMEMBER_YEB_EXP_GOLD_TASK_PREFIX = "AntMember::yebExpGoldTask::"
@@ -156,6 +180,12 @@ object StatusFlags {
     /** 余额宝体验金：今日待使用券已转换 */
     const val FLAG_ANTMEMBER_YEB_EXP_GOLD_VOUCHER_CONVERT_DONE = "AntMember::yebExpGoldVoucherConvertDone"
 
+    /** 账单贴纸：今日可领取贴纸及后续奖励已处理 */
+    const val FLAG_ANTMEMBER_STICKERS_DONE = "AntMember::stickersDone"
+
+    /** 账单拼贴世界：今日首页已确认无可继续处理项 */
+    const val FLAG_ANTMEMBER_BILL_BLOCK_WORLD_DONE = "AntMember::billBlockWorldDone"
+
     // ============================================================
     // 芝麻信用 / 芝麻粒
     // ============================================================
@@ -167,6 +197,9 @@ object StatusFlags {
     const val FLAG_SESAME_ZHIMA_TREE_TASK_HANDLED_TODAY: String =
         "AntSesameCredit::zhimaTreeTaskHandledToday"
 
+    /** 芝麻树：同一任务快照的不可重试动作当日止损。 */
+    const val FLAG_SESAME_ZHIMA_TREE_ACTION_STOP_PREFIX = "AntSesameCredit::zhimaTreeActionStop::"
+
     /** 芝麻信用：当日加入任务次数已达上限 */
     const val FLAG_SESAME_JOIN_LIMIT_REACHED: String = "AntSesameCredit::sesameJoinLimitReached"
 
@@ -176,20 +209,18 @@ object StatusFlags {
     /** 芝麻信用：今日是否已处理芝麻粒领取 */
     const val FLAG_SESAME_COLLECT_DONE: String = "AntSesameCredit::collectSesameDone"
 
+    /** 芝麻炼金：今天普通任务列表已确认无待处理项 */
+    const val FLAG_SESAME_ALCHEMY_TASKS_DONE = "AntSesameCredit::alchemy::tasksDone"
+
     /** 芝麻信用：芝麻粒炼金次日奖励是否已领取 */
     const val FLAG_SESAME_ALCHEMY_NEXT_DAY_AWARD: String = "AntSesameCredit::alchemy::nextDayAward"
 
+    /** 庄园芝麻大表鸽：最新炼金列表已确认今天没有后续雇佣任务 */
+    const val FLAG_FARM_ZHIMA_PIGEON_HIRE_DONE: String =
+        "AntFarm::zhimaPigeonHireDone"
+
     /** 芝麻信用：芝麻粒兑换今日是否已处理 */
     const val FLAG_SESAME_GRAIN_EXCHANGE_DONE: String = "AntSesameCredit::sesameGrainExchangeDone"
-
-    /** 信用 2101：图鉴章节任务是否全部完成 */
-    const val FLAG_CREDIT2101_CHAPTER_TASK_DONE: String = "FLAG_Credit2101_ChapterTask_Done"
-
-    /** 信用 2101：事件当日计数前缀 */
-    const val FLAG_CREDIT2101_EVENT_COUNT_PREFIX: String = "2101_Event_"
-
-    /** 信用 2101：事件当日计数后缀 */
-    const val FLAG_CREDIT2101_EVENT_COUNT_SUFFIX: String = "_COUNT_TODAY"
 
     /** 商家服务：每日签到 */
     const val FLAG_ANTMEMBER_MERCHANT_SIGN_DONE: String = "AntMember::merchantSignDone"
@@ -231,11 +262,43 @@ object StatusFlags {
     /** 今日运动问答是否已处理 */
     const val FLAG_ANTSPORTS_MOTION_DAILY_QUIZ_DONE: String = "AntSports::motionDailyQuizDone"
 
+    /** 运动问答：健康奖励泡泡已完成领取回查 */
+    const val FLAG_ANTSPORTS_MOTION_QUIZ_HEALTH_CONFIRMED = "AntSports::motionQuizHealthConfirmed"
+
+    /** 运动问答：绿色能量已取得收取回执 */
+    const val FLAG_ANTSPORTS_MOTION_QUIZ_GREEN_CONFIRMED = "AntSports::motionQuizGreenConfirmed"
+    const val FLAG_ANTSPORTS_MOTION_QUIZ_WELFARE_CONFIRMED = "AntSports::motionQuizWelfareConfirmed"
+
     /** 运动签到：今日已处理或已进入业务止损 */
     const val FLAG_ANTSPORTS_CHECK_IN_HANDLED_TODAY: String = "AntSports::checkInHandledToday"
 
     /** 运动首页气泡任务：按 taskId 维度的当日冷却前缀 */
     const val FLAG_ANTSPORTS_HOME_BUBBLE_COOLDOWN_PREFIX = "AntSports::homeBubbleCooldown::"
+
+    /** 运动首页气泡任务：完成动作已提交、等待服务端状态推进 */
+    const val FLAG_ANTSPORTS_HOME_BUBBLE_SUBMITTED_PREFIX = "AntSports::homeBubbleSubmitted::"
+
+    /** 运动首页气泡任务：已确认完成 */
+    const val FLAG_ANTSPORTS_HOME_BUBBLE_DONE_PREFIX = "AntSports::homeBubbleDone::"
+
+    /** 运动首页气泡奖励：按服务端记录 ID 确认已领取 */
+    const val FLAG_ANTSPORTS_HOME_BUBBLE_REWARD_RECEIVED_PREFIX = "AntSports::homeBubbleRewardReceived::"
+
+    /** 健康岛泡泡奖励：按服务端记录 ID 确认已领取 */
+    const val FLAG_NEVERLAND_BUBBLE_REWARD_RECEIVED_PREFIX = "AntSports::neverlandBubbleRewardReceived::"
+
+    /** 健康岛浏览任务或浏览泡泡：按 encryptValue 确认已领取 */
+    const val FLAG_NEVERLAND_BUBBLE_ENCRYPT_RECEIVED_PREFIX = "AntSports::neverlandBubbleEncryptReceived::"
+
+    /** 健康岛权益中心下拉奖励：按服务端 encryptValue 刷新确认已领取 */
+    const val FLAG_NEVERLAND_RIGHTS_CENTER_DROPDOWN_RECEIVED_PREFIX =
+        "AntSports::neverlandRightsCenterDropdownReceived::"
+
+    /** 健康岛任务中心：任务动作已提交、等待服务端状态推进 */
+    const val FLAG_NEVERLAND_TASK_SUBMITTED_PREFIX = "AntSports::neverlandTaskSubmitted::"
+
+    /** 健康岛任务中心：按 taskId 确认已完成 */
+    const val FLAG_NEVERLAND_TASK_DONE_PREFIX = "AntSports::neverlandTaskDone::"
 
     /** 走路挑战赛线上赛报名：今日报名不可继续，停止重复报名 */
     const val FLAG_ANTSPORTS_WALK_CHALLENGE_SIGNUP_BLOCKED_TODAY =
@@ -264,12 +327,39 @@ object StatusFlags {
     /** 神奇海洋：今日任务列表已确认无可执行项 */
     const val FLAG_ANTOCEAN_TASKS_DONE = "AntOcean::tasksDone"
 
+    /** 神奇海洋：连续访问任务今天已取得有效进度 */
+    const val FLAG_ANTOCEAN_CONSECUTIVE_VISIT_DONE = "AntOcean::consecutiveVisitDone"
+
+    /** 神奇海洋：完成动作被明确拒绝后，仅停止同一快照的当日重放。 */
+    const val FLAG_ANTOCEAN_ACTION_STOP_PREFIX = "AntOcean::taskActionStop::"
+
+    /** 海洋摸鱼：不可重试动作与主任务分开保存，便于独立清理。 */
+    const val FLAG_ANTOCEAN_AIFISH_ACTION_STOP_PREFIX = "AntOcean::aiFishActionStop::"
+
+    // ============================================================
+    // 神奇物种
+    // ============================================================
+
+    /** 神奇物种：今日卡片收集已由服务端确认完成 */
+    const val FLAG_ANTDODO_DAILY_COLLECT_DONE = "AntDodo::dailyCollectDone"
+
+    /** 神奇物种：今天连续抽卡已处理，累计进度仍待跨日推进 */
+    const val FLAG_ANTDODO_CONSECUTIVE_COLLECT_DONE = "AntDodo::consecutiveCollectDone"
+
+    /** 神奇物种：今天任务列表已确认无待处理项 */
+    const val FLAG_ANTDODO_TASKS_DONE = "AntDodo::tasksDone"
+
     // ============================================================
     // 农场 / 新村 / 团队
     // ============================================================
 
     /** 团队浇水：今日次数统计 */
     const val FLAG_TEAM_WATER_DAILY_COUNT: String = "Flag_Team_Weater_Daily_Count"
+
+    /** 农场：今天日常任务列表已确认无待处理项 */
+    const val FLAG_ANTORCHARD_TASKS_DONE = "AntOrchard::tasksDone"
+    const val FLAG_ANTORCHARD_HOME_GAME_DONE_PREFIX = "AntOrchard::homeGameDone::"
+    const val FLAG_ANTFOREST_READ_DONE = "AntForest::readDone"
 
     /** 农场组件：每日回访奖励 */
     const val FLAG_ANTORCHARD_WIDGET_DAILY_AWARD: String = "Flag_Antorchard_Widget_Daily_Award"
@@ -280,32 +370,35 @@ object StatusFlags {
     /** 摇钱树：今日施肥次数 */
     const val FLAG_ANTORCHARD_SPREAD_MANURE_COUNT_YEB = "ANTORCHARD_SPREAD_MANURE_COUNT_YEB"
 
+    // ============================================================
+    // 金豆夺宝
+    // ============================================================
+
+    /** 金豆夺宝：今日自动换豆消耗的肥料 */
+    const val FLAG_GOLDEN_BEAN_MANURE_EXCHANGE_AMOUNT =
+        "GOLDEN_BEAN_MANURE_EXCHANGE_AMOUNT"
+
+    /** 金豆夺宝：今日芝麻粒换豆已确认获得的金豆 */
+    const val FLAG_GOLDEN_BEAN_ZHIMA_EXCHANGE_BEAN_AMOUNT =
+        "GOLDEN_BEAN_ZHIMA_EXCHANGE_BEAN_AMOUNT"
+
+    /** 金豆夺宝：今日任务列表已确认无可执行项 */
+    const val FLAG_GOLDEN_BEAN_TASKS_DONE = "GoldenBeanTreasure::tasksDone"
+
+    /** 金豆夺宝：今日求签已确认完成 */
+    const val FLAG_GOLDEN_BEAN_FORTUNE_DRAWN = "GoldenBeanTreasure::fortuneDrawn"
+
+    /** 金豆商城：按商品规格记录今日已确认兑换次数 */
+    const val FLAG_GOLDEN_BEAN_MALL_EXCHANGE_COUNT_PREFIX = "GoldenBeanTreasure::mallExchangeCount::"
+
     /** 摇钱树：今日是否已收取金币树奖励 */
     const val FLAG_ANTORCHARD_MONEY_TREE_COLLECTED = "ANTORCHARD_MONEY_TREE_COLLECTED"
 
     /** 农场好友助力：好友关系无效前缀 */
     const val FLAG_ANTORCHARD_ASSIST_RELATION_INVALID_PREFIX = "orchard::assistRelationInvalid::"
 
-    /** 福气鱼池：今日签到已处理 */
-    const val FLAG_ANTFISHPOND_SIGN_DONE = "AntFishPond::signDone"
-
-    /** 福气鱼池：每日宝箱已领取 */
-    const val FLAG_ANTFISHPOND_GIFT_BOX_DONE = "AntFishPond::giftBoxDone"
-
-    /** 福气鱼池：明日钓竿奖励已领取 */
-    const val FLAG_ANTFISHPOND_TOMORROW_ROD_DONE = "AntFishPond::tomorrowRodDone"
-
-    /** 福气鱼池：今日稳定任务已无可执行项 */
-    const val FLAG_ANTFISHPOND_TASKS_DONE = "AntFishPond::tasksDone"
-
-    /** 福气鱼池：缺少 fishpondAngle riskToken */
-    const val FLAG_ANTFISHPOND_RISK_TOKEN_MISSING = "AntFishPond::riskTokenMissing"
-
-    /** 福气鱼池：今日自动钓鱼次数 */
-    const val FLAG_ANTFISHPOND_FISH_COUNT = "AntFishPond::fishCount"
-
-    /** 福气鱼池：今日自动钓鱼达到配置上限 */
-    const val FLAG_ANTFISHPOND_FISH_LIMIT_REACHED = "AntFishPond::fishLimitReached"
+    /** 农场抽抽乐：今日已探测新一轮活动（探测成功或服务端确认失效均消耗，当日不再探测，跨日自动重置） */
+    const val FLAG_ANTORCHARD_DRAW_ACTIVITY_PROBED = "orchard::drawActivityProbed"
 
     /** 蚂蚁新村：今日丢肥料是否达到上限 */
     const val FLAG_ANTSTALL_THROW_MANURE_LIMIT: String = "Flag_AntStall_Throw_Manure_Limit"
@@ -331,19 +424,20 @@ object StatusFlags {
     /** 庄园：加速卡每日次数上限标记 */
     const val FLAG_FARM_ACCELERATE_LIMIT = "antFarm::accelerateLimit"
 
-    /** 庄园：特殊食品今日已使用数量 */
+    /** 庄园：加饭卡今日已使用次数（每日上限 2 次） */
+    const val FLAG_FARM_BIG_EATER_USED_COUNT = "antFarm::bigEaterUsedCount"
+
+    /** 庄园：日常特殊食品今日已使用数量 */
     const val FLAG_FARM_SPECIAL_FOOD_DAILY_COUNT = "antFarm::specialFoodDailyCount"
 
-    /** 庄园：特殊食品今日已达自定义上限 */
+    /** 庄园：日常特殊食品今日已达自定义上限 */
     const val FLAG_FARM_SPECIAL_FOOD_LIMIT = "antFarm::specialFoodLimit"
 
-    /** 庄园：排位赛特殊食品今日已使用数量 */
-    const val FLAG_FARM_SPECIAL_FOOD_DONATION_COMPETITION_DAILY_COUNT =
-        "antFarm::specialFoodDonationCompetitionDailyCount"
+    /** 庄园：排位赛与爱心鸡结号共用的特殊食品今日已使用数量 */
+    const val FLAG_FARM_SPECIAL_FOOD_ACTIVITY_DAILY_COUNT = "antFarm::specialFoodActivityDailyCount"
 
-    /** 庄园：排位赛特殊食品今日已达自定义上限 */
-    const val FLAG_FARM_SPECIAL_FOOD_DONATION_COMPETITION_LIMIT =
-        "antFarm::specialFoodDonationCompetitionLimit"
+    /** 庄园：活动特殊食品今日已达自定义上限 */
+    const val FLAG_FARM_SPECIAL_FOOD_ACTIVITY_LIMIT = "antFarm::specialFoodActivityLimit"
 
     /** 庄园：今日是否已签到 */
     const val FLAG_FARM_SIGNED = "antFarm::signed"
@@ -363,17 +457,11 @@ object StatusFlags {
     /** 庄园：好友串门邀请今日已处理 */
     const val FLAG_FARM_INVITE_FRIEND_VISIT_FAMILY = "antFarm::inviteFriendVisitFamily"
 
-    /** 庄园：家庭批量串门送扭蛋今日已处理 */
-    const val FLAG_FARM_FAMILY_BATCH_INVITE_P2P = "antFarm::familyBatchInviteP2P"
-
     /** 庄园答题：今日已答题 */
     const val FLAG_FARM_QUESTION_ANSWERED = "farmQuestion::answered"
 
     /** 庄园答题：今日已缓存明日答案 */
     const val FLAG_FARM_QUESTION_CACHE = "farmQuestion::cache"
-
-    /** 庄园饲料任务：时间触发槽已消费到的索引 */
-    const val FLAG_FARM_TASK_TRIGGER_INDEX = "antFarm::farmTask::triggerIndex"
 
     /** 庄园抽抽乐：限时任务今日已结束前缀 */
     const val FLAG_FARM_CHOUCHOULE_LIMITED_ENDED_PREFIX = "antFarm::chouchouleLimitedEnded::"
@@ -387,6 +475,9 @@ object StatusFlags {
     /** 庄园：捐蛋排位赛奖励今日已领取 */
     const val FLAG_FARM_DONATION_COMPETITION_AWARD_RECEIVED = "antFarm::donationCompetitionAwardReceived"
 
+    /** 庄园：服务端明确报告排位赛活动不存在，今日停止该业务链 */
+    const val FLAG_FARM_DONATION_COMPETITION_UNAVAILABLE = "antFarm::donationCompetitionUnavailable"
+
     /** 庄园家庭：今日签到已处理 */
     const val FLAG_FARM_FAMILY_SIGNED = "antFarm::familyDailySign"
 
@@ -399,8 +490,8 @@ object StatusFlags {
     /** 庄园家庭：今日好友分享已处理 */
     const val FLAG_FARM_FAMILY_SHARE_TO_FRIENDS = "antFarm::familyShareToFriends"
 
-    /** 森林：能量雨机会卡今日已使用 */
-    const val FLAG_FOREST_RAIN_CHANCE_CARD = "AntForest::useEnergyRainChanceCard"
+    /** 庄园家庭装扮：按活动 ID 标记今日已完成检查 */
+    const val FLAG_FARM_FAMILY_DECORATION_CHECK_DONE_PREFIX = "antFarm::familyDecorationCheckDone::"
 
     /** 森林：限时能量雨机会今日使用前缀 */
     const val FLAG_FOREST_RAIN_LIMIT_TIME_CHANCE_PREFIX = "AntForest::useEnergyRainChanceCard::LIMIT_TIME_ENERGY_RAIN_CHANCE::"
@@ -410,5 +501,4 @@ object StatusFlags {
 
     /** 森林：能量雨附加游戏任务标记 */
     const val FLAG_FOREST_RAIN_GAME_TASK = "AntForest::EnergyRainGameTask"
-
 }

@@ -3,14 +3,16 @@ package io.github.aoguai.sesameag.util
 enum class LogModuleDomain(val displayName: String) {
     COMMON("通用"),
     FOREST("蚂蚁森林"),
+    FOREST_PATROL("保护地巡护"),
     ORCHARD("芭芭农场"),
+    GOLDEN_BEAN("金豆夺宝"),
     FARM("蚂蚁庄园"),
     STALL("蚂蚁新村"),
     OCEAN("神奇海洋"),
     DODO("神奇物种"),
     MEMBER("会员"),
+    YOUTH_PRIVILEGE("青春特权"),
     MYBANK("网商银行"),
-    FISHPOND("福气鱼池"),
     SPORTS("运动"),
     GREEN_FINANCE("绿色经营"),
     SESAME_CREDIT("芝麻信用"),
@@ -52,10 +54,12 @@ enum class LogChannel(
 ) {
     SYSTEM(
         loggerName = "system",
-        displayName = "系统日志",
+        displayName = "系统诊断",
         moduleDomain = LogModuleDomain.SYSTEM,
         techKind = LogTechKind.SYSTEM,
         description = "模块内部系统日志",
+        viewerGroup = LogViewerGroup.TECHNICAL,
+        visibleInViewer = true,
     ),
     RECORD(
         loggerName = "record",
@@ -97,6 +101,17 @@ enum class LogChannel(
         visibleInViewer = true,
         logTag = "森林"
     ),
+    FOREST_PATROL(
+        loggerName = "forest_patrol",
+        displayName = "保护地巡护日志",
+        moduleDomain = LogModuleDomain.FOREST_PATROL,
+        techKind = LogTechKind.BUSINESS,
+        description = "新旧巡护、动物能量与派遣、保护证书日志",
+        viewerGroup = LogViewerGroup.MODULES,
+        mirrorToRecord = true,
+        visibleInViewer = true,
+        logTag = "保护地巡护"
+    ),
     ORCHARD(
         loggerName = "orchard",
         displayName = "农场日志",
@@ -107,6 +122,17 @@ enum class LogChannel(
         mirrorToRecord = true,
         visibleInViewer = true,
         logTag = "农场"
+    ),
+    GOLDEN_BEAN(
+        loggerName = "golden_bean",
+        displayName = "金豆夺宝日志",
+        moduleDomain = LogModuleDomain.GOLDEN_BEAN,
+        techKind = LogTechKind.BUSINESS,
+        description = "金豆夺宝签到、任务、金猫矿工、金豆乐园与肥料换豆日志",
+        viewerGroup = LogViewerGroup.MODULES,
+        mirrorToRecord = true,
+        visibleInViewer = true,
+        logTag = "金豆夺宝"
     ),
     FARM(
         loggerName = "farm",
@@ -163,6 +189,17 @@ enum class LogChannel(
         visibleInViewer = true,
         logTag = "会员"
     ),
+    YOUTH_PRIVILEGE(
+        loggerName = "youth_privilege",
+        displayName = "青春特权日志",
+        moduleDomain = LogModuleDomain.YOUTH_PRIVILEGE,
+        techKind = LogTechKind.BUSINESS,
+        description = "青春特权签到、森林道具与青春任务相关日志",
+        viewerGroup = LogViewerGroup.MODULES,
+        mirrorToRecord = true,
+        visibleInViewer = true,
+        logTag = "青春特权"
+    ),
     MYBANK(
         loggerName = "mybank",
         displayName = "网商银行日志",
@@ -173,17 +210,6 @@ enum class LogChannel(
         mirrorToRecord = true,
         visibleInViewer = true,
         logTag = "网商银行"
-    ),
-    FISHPOND(
-        loggerName = "fishpond",
-        displayName = "福气鱼池日志",
-        moduleDomain = LogModuleDomain.FISHPOND,
-        techKind = LogTechKind.BUSINESS,
-        description = "福气鱼池钓竿、任务、钓鱼与兑换进度相关日志",
-        viewerGroup = LogViewerGroup.MODULES,
-        mirrorToRecord = true,
-        visibleInViewer = true,
-        logTag = "福气鱼池"
     ),
     SPORTS(
         loggerName = "sports",
@@ -299,9 +325,24 @@ object LogCatalog {
             "Vitality",
             "WhackMole"
         ),
+        LogChannel.FOREST_PATROL to setOf(
+            "AntForestPatrol",
+            "AntForestPatrolRpcCall",
+            "LegacyPatrolWorkflow",
+            "MonopolyPatrolWorkflow",
+            "保护地巡护"
+        ),
         LogChannel.ORCHARD to setOf(
             "AntOrchard",
             "XLightRpcCall"
+        ),
+        LogChannel.GOLDEN_BEAN to setOf(
+            "GoldenBeanTreasure",
+            "GoldenBeanWorkflow",
+            "GoldenBeanTreasureSupport",
+            "GoldenBeanRpcCall",
+            "GoldenBean",
+            "金豆夺宝"
         ),
         LogChannel.FARM to setOf(
             "AntFarm",
@@ -323,11 +364,12 @@ object LogCatalog {
         LogChannel.MEMBER to setOf(
             "AntMember"
         ),
+        LogChannel.YOUTH_PRIVILEGE to setOf(
+            "YouthPrivilege",
+            "YouthPrivilegeRpcCall"
+        ),
         LogChannel.MYBANK to setOf(
             "MyBankWelfare"
-        ),
-        LogChannel.FISHPOND to setOf(
-            "AntFishPond"
         ),
         LogChannel.SPORTS to setOf(
             "AntSports",

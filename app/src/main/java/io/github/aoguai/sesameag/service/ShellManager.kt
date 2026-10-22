@@ -47,19 +47,6 @@ class ShellManager(context: Context) {
         onStateChanged?.invoke(currentType)
     }
 
-    /**
-     * 2. 新增 reset 方法
-     * 用于强制重置选择状态（例如 Shizuku 授权后）
-     */
-    fun reset() {
-        if (selectedShell == null) {
-            return
-        }
-        selectedShell = null
-        Log.d(TAG, "ShellManager 已重置，下次执行将重新选择 Executor")
-        notifyChange() // 🔥 通知：重置了
-    }
-
     private suspend fun selectExecutor(notifyUnavailable: Boolean = true) {
         selectionMutex.withLock {
             // 如果已经选中且可用，直接返回
@@ -125,8 +112,8 @@ class ShellManager(context: Context) {
     /**
      * 执行命令
      */
-    suspend fun exec(command: String): ShellResult {
-        selectExecutor()
+    suspend fun exec(command: String, refreshExecutor: Boolean = true): ShellResult {
+        if (refreshExecutor) selectExecutor()
         val shell = selectedShell ?: return ShellResult( "", "No valid Root/Shizuku shell found.",-1)
         Log.d(TAG, "执行命令: $command (via $selectedName)")
         return shell.exec(command, 5_000L)

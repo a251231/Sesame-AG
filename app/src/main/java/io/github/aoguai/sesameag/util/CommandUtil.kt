@@ -1,14 +1,17 @@
 package io.github.aoguai.sesameag.util
 
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
 import android.os.RemoteException
+import io.github.aoguai.sesameag.BuildConfig
 import io.github.aoguai.sesameag.ICallback
 import io.github.aoguai.sesameag.ICommandService
 import io.github.aoguai.sesameag.IStatusListener
+import io.github.aoguai.sesameag.hook.keepalive.SystemWakeScheduler
 import io.github.aoguai.sesameag.service.CommandService
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
@@ -17,6 +20,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 命令服务客户端工具类
@@ -26,6 +30,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 object CommandUtil {
 
     private const val TAG = "CommandUtil"
+    internal const val DIAGNOSTIC_LOGCAT_COMMAND =
+        "logcat -b main -b system -b crash -d -t 64 -v epoch -v uid SesameLog:W LibXposedRuntime:W ApplicationHook:W AndroidRuntime:W '*:S'"
     private const val ACTION_BIND = "io.github.aoguai.sesameag.action.BIND_COMMAND_SERVICE"
     private const val BIND_TIMEOUT_MS = 5000L      // 绑定超时时间
     private const val EXEC_TIMEOUT_MS = 15000L     // 命令执行超时时间
@@ -48,11 +54,29 @@ object CommandUtil {
     val serviceStatus = _serviceStatus.asStateFlow()
 
     // AIDL 接口实例
+    @Volatile
     private var commandService: ICommandService? = null
+    private val alarmIntents = java.util.concurrent.ConcurrentHashMap<Int, PendingIntent>()
+
+    fun getPersistentScheduleAlarmIntent(lane: Int): PendingIntent? {
+        require(lane == SystemWakeScheduler.LANE_EXACT || lane == SystemWakeScheduler.LANE_FLEXIBLE)
+        alarmIntents[lane]?.let { return it }
+        val service = commandService ?: return null
+        return try {
+            service.getPersistentScheduleAlarmIntent(lane)?.also { alarmIntents[lane] = it }
+        } catch (e: RemoteException) {
+            handleServiceLost()
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "获取持久调度令牌失败", e)
+            null
+        }
+    }
 
     // 连接状态管理
     private val bindMutex = Mutex()
     private val isBound = AtomicBoolean(false)
+    private val pendingCommands = AtomicInteger(0)
     private var connectionDeferred: CompletableDeferred<Boolean>? = null
     @Volatile
     private var bindRequested = false
@@ -77,6 +101,7 @@ object CommandUtil {
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             Log.d(TAG, "✅ CommandService 已连接: $name")
+            ModuleDiagnostics.event("command_bind", "connected", "component=$name")
             try {
                 commandService = ICommandService.Stub.asInterface(service)
 
@@ -92,7 +117,12 @@ object CommandUtil {
 
                 isBound.set(true)
                 connectionDeferred?.complete(true)
-                if (!bindRequested) {
+                boundContext?.let { appContext ->
+                    scope.launch {
+                        SystemWakeScheduler.refresh(appContext)
+                    }
+                }
+                if (!bindRequested && pendingCommands.get() == 0) {
                     boundContext?.let { appContext ->
                         scope.launch {
                             unbind(appContext)
@@ -113,7 +143,9 @@ object CommandUtil {
     }
 
     private fun handleServiceLost(updateStatus: Boolean = true) {
+        ModuleDiagnostics.event("command_bind", "lost", "updateStatus=$updateStatus")
         commandService = null
+        alarmIntents.clear()
         isBound.set(false)
         connectionDeferred = null
         lastStatusType = null
@@ -132,8 +164,9 @@ object CommandUtil {
         }
     }
 
-    private fun buildServiceIntent(context: Context): Intent {
-        return Intent(context.applicationContext, CommandService::class.java).apply {
+    private fun buildServiceIntent(): Intent {
+        return Intent().apply {
+            component = ComponentName(BuildConfig.APPLICATION_ID, CommandService::class.java.name)
             action = ACTION_BIND
         }
     }
@@ -155,7 +188,7 @@ object CommandUtil {
         boundContext = appContext
         scope.launch {
             val bound = ensureServiceBound(appContext)
-            if (bound && !bindRequested) {
+            if (bound && !bindRequested && pendingCommands.get() == 0) {
                 unbind(appContext)
             }
         }
@@ -181,15 +214,15 @@ object CommandUtil {
             connectionDeferred = CompletableDeferred()
             val appContext = context.applicationContext
             boundContext = appContext
-            val intent = buildServiceIntent(appContext)
+            val intent = buildServiceIntent()
+            var lastFailure = "not_attempted"
+            val bindContext = "caller=${appContext.packageName} uid=${android.os.Process.myUid()} component=${intent.component} action=$ACTION_BIND"
 
             try {
                 repeat(BIND_RETRY_COUNT) { attempt ->
                     startCommandService(appContext, intent)
                     if (attempt > 0) {
                         delay(BIND_RETRY_DELAY_MS)
-                    } else {
-                        delay(300)
                     }
 
                     val bindResult = appContext.bindService(
@@ -207,7 +240,9 @@ object CommandUtil {
                             return@withLock true
                         }
 
-                        Log.w(TAG, "⚠️ 第 ${attempt + 1} 次绑定超时")
+                        lastFailure = "bind_timeout"
+                        Log.w(TAG, "command_bind reason=$lastFailure attempt=${attempt + 1} timeoutMs=$BIND_TIMEOUT_MS $bindContext")
+                        ModuleDiagnostics.event("command_bind", lastFailure, "attempt=${attempt + 1} $bindContext")
                         try {
                             appContext.unbindService(serviceConnection)
                         } catch (_: Exception) {
@@ -218,14 +253,21 @@ object CommandUtil {
                         return@repeat
                     }
 
-                    Log.w(TAG, "⚠️ 第 ${attempt + 1} 次 bindService 返回 false")
+                    lastFailure = "bind_false"
+                    Log.w(TAG, "command_bind reason=$lastFailure attempt=${attempt + 1} $bindContext")
+                    ModuleDiagnostics.event("command_bind", lastFailure, "attempt=${attempt + 1} $bindContext")
                 }
 
-                Log.e(TAG, "❌ bindService 返回 false")
+                Log.e(TAG, "command_bind failed reason=$lastFailure $bindContext")
                 _serviceStatus.value = ServiceStatus.Error("服务绑定失败")
                 return@withLock false
+            } catch (e: CancellationException) {
+                runCatching { appContext.unbindService(serviceConnection) }
+                handleServiceLost()
+                throw e
             } catch (e: Exception) {
-                Log.e(TAG, "绑定异常", e)
+                ModuleDiagnostics.event("command_bind", "exception", "$bindContext error=${e.javaClass.simpleName}")
+                Log.e(TAG, "绑定异常 $bindContext", e)
                 _serviceStatus.value = ServiceStatus.Error(e.message ?: "未知错误")
                 return@withLock false
             }
@@ -236,33 +278,69 @@ object CommandUtil {
      * 执行命令
      */
     suspend fun executeCommand(context: Context, command: String): String? = withContext(Dispatchers.IO) {
-        if (!ensureServiceBound(context)) {
-            return@withContext null
-        }
-
-        val service = commandService ?: return@withContext null
-        val resultDeferred = CompletableDeferred<String?>()
-
-        val callback = object : ICallback.Stub() {
-            override fun onSuccess(output: String) {
-                resultDeferred.complete(output)
-            }
-
-            override fun onError(error: String) {
-                Log.e(TAG, "Cmd Error: $error")
-                resultDeferred.complete(null)
-            }
-        }
-
+        pendingCommands.incrementAndGet()
         try {
+            if (!ensureServiceBound(context)) return@withContext null
+            val service = commandService ?: return@withContext null
+            val resultDeferred = CompletableDeferred<String?>()
+            val callback = object : ICallback.Stub() {
+                override fun onSuccess(output: String) {
+                    resultDeferred.complete(output)
+                }
+                override fun onError(error: String) {
+                    Log.e(TAG, "Cmd Error: $error")
+                    resultDeferred.complete(null)
+                }
+            }
             service.executeCommand(command, callback)
             withTimeoutOrNull(EXEC_TIMEOUT_MS) { resultDeferred.await() }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: RemoteException) {
             handleServiceLost()
             null
         } catch (e: Exception) {
             Log.e(TAG, "Cmd Exception", e)
             null
+        } finally {
+            if (pendingCommands.decrementAndGet() == 0 && !bindRequested) unbind(context)
+        }
+    }
+
+    /** 只消费已就绪的执行器；诊断读取不绑定服务或发起授权。 */
+    internal suspend fun readDiagnosticLogcat(): Result<String> = withContext(Dispatchers.IO) {
+        val service = commandService
+        if (service == null || serviceStatus.value !is ServiceStatus.Active) {
+            return@withContext Result.failure(IllegalStateException("executor_unavailable"))
+        }
+        val response = CompletableDeferred<Result<String>>()
+        try {
+            service.executeCommand(DIAGNOSTIC_LOGCAT_COMMAND, object : ICallback.Stub() {
+                override fun onSuccess(output: String) {
+                    response.complete(Result.success(output))
+                }
+                override fun onError(error: String) {
+                    response.complete(Result.failure(java.io.IOException(error.take(256))))
+                }
+            })
+            withTimeout(EXEC_TIMEOUT_MS) { response.await() }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    fun isExecutionAllowed(userId: String): Boolean {
+        val service = commandService ?: return false
+        return try {
+            service.isExecutionAllowed(userId)
+        } catch (e: RemoteException) {
+            handleServiceLost()
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "执行条件查询失败", e)
+            false
         }
     }
 
@@ -273,6 +351,7 @@ object CommandUtil {
         context: Context,
         timeoutMs: Long = BIND_TIMEOUT_MS + 1500L
     ): ServiceStatus = withContext(Dispatchers.IO) {
+        bindRequested = true
         if (!ensureServiceBound(context)) {
             return@withContext _serviceStatus.value
         }
@@ -292,6 +371,7 @@ object CommandUtil {
      */
     fun unbind(context: Context) {
         bindRequested = false
+        if (pendingCommands.get() > 0) return
         val appContext = context.applicationContext
         boundContext = appContext
         if (isBound.compareAndSet(true, false)) {

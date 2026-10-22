@@ -26,6 +26,28 @@ data class AccountSessionIdentity(
     val sessionEpoch: Long
 )
 
+sealed interface AccountSessionCheck {
+    data object NoCurrentSession : AccountSessionCheck
+
+    data class AccountMismatch(
+        val requestedUserId: String,
+        val currentUserId: String,
+    ) : AccountSessionCheck
+
+    data class EpochMismatch(
+        val requestedEpoch: Long,
+        val currentEpoch: Long,
+    ) : AccountSessionCheck
+
+    data object RuntimeIdentityUntrusted : AccountSessionCheck
+
+    data class AccountSlotInactive(val userId: String) : AccountSessionCheck
+
+    data object AccountSlotRegistryUnavailable : AccountSessionCheck
+
+    data class Current(val session: ActiveAccountSession) : AccountSessionCheck
+}
+
 private data class PersistedAccountSession(
     val userId: String = "",
     val sessionEpoch: Long = 0L,
@@ -48,6 +70,14 @@ object AccountSessionCoordinator {
     private var pendingEpoch: Long = 0L
 
     fun currentSession(): ActiveAccountSession? = currentSession
+
+    @Synchronized
+    fun <T> withCurrentSession(identity: AccountSessionIdentity, action: () -> T): T {
+        check(!switchInProgress && checkCurrentSession(identity.userId, identity.sessionEpoch) is AccountSessionCheck.Current) {
+            "账号会话已变化"
+        }
+        return action()
+    }
 
     fun currentUserId(): String? = currentSession?.userId
 
@@ -81,12 +111,7 @@ object AccountSessionCoordinator {
 
     fun isSwitching(): Boolean = switchInProgress
 
-    fun hasActiveSessionFor(userId: String?): Boolean {
-        val safeUserId = userId?.trim().orEmpty()
-        val current = currentSession ?: return false
-        return safeUserId.isNotEmpty() && current.userId == safeUserId
-    }
-
+    @Synchronized
     fun beginSessionSwitch(
         reason: String,
         targetUserId: String?,
@@ -117,6 +142,7 @@ object AccountSessionCoordinator {
         return newEpoch
     }
 
+    @Synchronized
     fun clearRuntimeSession(reason: String) {
         currentSession = null
         switchInProgress = false
@@ -124,6 +150,7 @@ object AccountSessionCoordinator {
         Log.record(TAG, "clear runtime session: reason=$reason")
     }
 
+    @Synchronized
     fun cancelSessionSwitch(reason: String) {
         clearRuntimeSession("cancel_session_switch:$reason")
     }
@@ -139,6 +166,7 @@ object AccountSessionCoordinator {
         )
     }
 
+    @Synchronized
     fun applySession(
         context: Context?,
         userId: String,
@@ -149,6 +177,8 @@ object AccountSessionCoordinator {
     ): ActiveAccountSession {
         val safeUserId = userId.trim()
         require(safeUserId.isNotEmpty()) { "userId must not be blank" }
+        require(AccountSlotRegistry.isExecutableUser(safeUserId)) { "userId is not executable" }
+        require(RuntimeIdentityGuard.isTrustedForExecution()) { "runtime identity is not trusted" }
         val now = System.currentTimeMillis()
         val epoch = pendingEpoch.takeIf { it > 0L } ?: epochGenerator.incrementAndGet()
         val snapshot = UserMap.ensureActiveUserSnapshot(safeUserId, activeUserSnapshot)
@@ -160,6 +190,9 @@ object AccountSessionCoordinator {
             sessionEpoch = epoch,
             switchedAtMs = now
         )
+        if (context != null) {
+            PersistentScheduleRegistry.recoverInterruptedExecutions(safeUserId, epoch)
+        }
         synchronizeEpochGenerator(epoch)
         currentSession = session
         switchInProgress = false
@@ -176,6 +209,7 @@ object AccountSessionCoordinator {
         return session
     }
 
+    @Synchronized
     fun refreshWorkflowState(
         context: Context?,
         reason: String,
@@ -186,9 +220,12 @@ object AccountSessionCoordinator {
         val sessionIsCurrent = UserMap.currentUid?.trim().orEmpty() == current.userId
         val workflowAllowed =
             WorkflowRootGuard.hasGrantedRoot() &&
+                WorkflowRootGuard.isExecutionAllowed() &&
                 accepted &&
                 !ApplicationHookConstants.isOffline() &&
-                sessionIsCurrent
+                sessionIsCurrent &&
+                RuntimeIdentityGuard.isTrustedForExecution() &&
+                AccountSlotRegistry.isExecutableUser(current.userId)
         if (current.workflowAllowed == workflowAllowed && current.legalAccepted == accepted) {
             return current
         }
@@ -207,6 +244,7 @@ object AccountSessionCoordinator {
         return updated
     }
 
+    @Synchronized
     fun blockWorkflow(
         context: Context?,
         reason: String,
@@ -248,29 +286,39 @@ object AccountSessionCoordinator {
         if (switchInProgress) {
             return false
         }
-        val current = currentSession ?: return false
-        val ownerUserId = trigger.ownerUserId?.trim().orEmpty()
-        if (ownerUserId.isEmpty() || ownerUserId != current.userId) {
-            return false
-        }
-        return trigger.sessionEpoch == current.sessionEpoch
+        return checkCurrentSession(trigger.ownerUserId, trigger.sessionEpoch) is AccountSessionCheck.Current
     }
 
-    fun isCurrentSession(userId: String?, sessionEpoch: Long): Boolean {
-        val current = currentSession ?: return false
+    fun checkCurrentSession(
+        userId: String?,
+        sessionEpoch: Long,
+    ): AccountSessionCheck {
+        if (switchInProgress) return AccountSessionCheck.NoCurrentSession
+        val current = currentSession ?: return AccountSessionCheck.NoCurrentSession
         val safeUserId = userId?.trim().orEmpty()
-        if (safeUserId.isEmpty()) return false
-        return current.userId == safeUserId && current.sessionEpoch == sessionEpoch
+        if (safeUserId.isEmpty() || current.userId != safeUserId) {
+            return AccountSessionCheck.AccountMismatch(safeUserId, current.userId)
+        }
+        if (current.sessionEpoch != sessionEpoch) {
+            return AccountSessionCheck.EpochMismatch(sessionEpoch, current.sessionEpoch)
+        }
+        if (!RuntimeIdentityGuard.isTrustedForExecution()) {
+            return AccountSessionCheck.RuntimeIdentityUntrusted
+        }
+        return when (val slotCheck = AccountSlotRegistry.checkExecutableUser(current.userId)) {
+            is AccountSlotExecutionCheck.Allowed -> AccountSessionCheck.Current(current)
+            is AccountSlotExecutionCheck.Inactive,
+            is AccountSlotExecutionCheck.InvalidUserId,
+            -> AccountSessionCheck.AccountSlotInactive(current.userId)
+            AccountSlotExecutionCheck.RegistryUnavailable -> AccountSessionCheck.AccountSlotRegistryUnavailable
+        }
     }
 
-    fun isScheduleRoutable(schedule: PersistentSchedule): Boolean {
-        val current = currentSession ?: return false
-        val ownerUserId = schedule.ownerUserId?.trim().orEmpty()
-        if (ownerUserId.isEmpty() || ownerUserId != current.userId) {
-            return false
-        }
-        return schedule.sessionEpoch == current.sessionEpoch
-    }
+    fun isCurrentSession(userId: String?, sessionEpoch: Long): Boolean =
+        checkCurrentSession(userId, sessionEpoch) is AccountSessionCheck.Current
+
+    fun isScheduleRoutable(schedule: PersistentSchedule): Boolean =
+        checkCurrentSession(schedule.ownerUserId, schedule.sessionEpoch) is AccountSessionCheck.Current
 
     private fun persistSession(session: ActiveAccountSession) {
         runCatching {

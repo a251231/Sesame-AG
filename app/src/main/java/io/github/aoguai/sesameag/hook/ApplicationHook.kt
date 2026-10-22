@@ -8,8 +8,8 @@ import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageInfo
 import android.content.SharedPreferences
+import android.content.pm.PackageInfo
 import android.content.res.Configuration
 import android.os.Build
 import android.os.Handler
@@ -28,14 +28,17 @@ import io.github.aoguai.sesameag.hook.Toast.show
 import io.github.aoguai.sesameag.hook.TokenHooker.start
 import io.github.aoguai.sesameag.hook.XposedEnv.processName
 import io.github.aoguai.sesameag.hook.internal.AlipayMiniMarkHelper
-import io.github.aoguai.sesameag.hook.internal.LocationHelper
 import io.github.aoguai.sesameag.hook.internal.AuthCodeHelper
+import io.github.aoguai.sesameag.hook.internal.LocationHelper
 import io.github.aoguai.sesameag.hook.internal.SecurityBodyHelper
-import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleDefaults
 import io.github.aoguai.sesameag.hook.keepalive.PersistentLaunchPolicy
 import io.github.aoguai.sesameag.hook.keepalive.PersistentReconcileMode
+import io.github.aoguai.sesameag.hook.keepalive.PersistentSchedule
+import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleDefaults
 import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleKind
+import io.github.aoguai.sesameag.hook.keepalive.PersistentSchedulePrecisionPolicy
 import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleRegistry
+import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleState
 import io.github.aoguai.sesameag.hook.keepalive.ScheduledTaskRouter
 import io.github.aoguai.sesameag.hook.keepalive.SystemWakeScheduler
 import io.github.aoguai.sesameag.hook.keepalive.UnifiedScheduler
@@ -44,6 +47,7 @@ import io.github.aoguai.sesameag.hook.rpc.bridge.RpcBridge
 import io.github.aoguai.sesameag.hook.rpc.capture.RpcTrafficCapture
 import io.github.aoguai.sesameag.hook.rpc.intervallimit.RpcIntervalLimit.clearIntervalLimit
 import io.github.aoguai.sesameag.hook.server.ModuleHttpServerManager.startIfNeeded
+import io.github.aoguai.sesameag.model.BaseModel
 import io.github.aoguai.sesameag.model.BaseModel.Companion.batteryPerm
 import io.github.aoguai.sesameag.model.BaseModel.Companion.checkInterval
 import io.github.aoguai.sesameag.model.BaseModel.Companion.debugMode
@@ -55,18 +59,18 @@ import io.github.aoguai.sesameag.model.Model
 import io.github.aoguai.sesameag.task.CoroutineTaskRunner
 import io.github.aoguai.sesameag.task.MainTask
 import io.github.aoguai.sesameag.task.ModelTask.Companion.stopAllTask
-import io.github.aoguai.sesameag.task.ModelTask.Companion.stopAllTaskAndWait
 import io.github.aoguai.sesameag.task.antForest.EnergyWaitingManager
 import io.github.aoguai.sesameag.util.DataStore.init
 import io.github.aoguai.sesameag.util.Files
 import io.github.aoguai.sesameag.util.GlobalThreadPools.execute
 import io.github.aoguai.sesameag.util.GlobalThreadPools.shutdownAndRestart
+import io.github.aoguai.sesameag.util.CommandUtil
+import io.github.aoguai.sesameag.util.LocaleSettingsApplier
 import io.github.aoguai.sesameag.util.Log
-import io.github.aoguai.sesameag.util.Logback
 import io.github.aoguai.sesameag.util.Log.error
 import io.github.aoguai.sesameag.util.Log.printStackTrace
 import io.github.aoguai.sesameag.util.Log.record
-import io.github.aoguai.sesameag.util.LocaleSettingsApplier
+import io.github.aoguai.sesameag.util.Logback
 import io.github.aoguai.sesameag.util.ModuleStatus
 import io.github.aoguai.sesameag.util.Notify
 import io.github.aoguai.sesameag.util.Notify.stopRunning
@@ -75,27 +79,30 @@ import io.github.aoguai.sesameag.util.PermissionUtil.checkBatteryPermissions
 import io.github.aoguai.sesameag.util.TimeTriggerEvaluator
 import io.github.aoguai.sesameag.util.TimeTriggerParser
 import io.github.aoguai.sesameag.util.TimeUtil
+import io.github.aoguai.sesameag.util.WakeLockManager
 import io.github.aoguai.sesameag.util.WorkflowRootGuard
 import io.github.aoguai.sesameag.util.friend.FriendRepository
 import io.github.aoguai.sesameag.util.maps.UserMap
 import io.github.aoguai.sesameag.util.maps.UserMap.currentUid
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
-import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.lang.AutoCloseable
 import java.lang.reflect.Method
 import java.util.Calendar
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import kotlin.concurrent.Volatile
 
 class ApplicationHook {
-    var xposedInterface: XposedInterface? = null
+    private var xposedInterface: XposedInterface? = null
         set(value) {
             field = value
             updateFrameworkRuntimeInfo(value)
         }
+
+    internal fun attachLibXposedRuntime(runtime: XposedInterface) {
+        xposedInterface = runtime
+    }
 
     private class TaskLock : AutoCloseable {
         private val acquired: Boolean
@@ -122,32 +129,42 @@ class ApplicationHook {
 
     // --- 入口方法 ---
     fun loadPackage(lpparam: PackageReadyParam) {
-        if (General.PACKAGE_NAME != lpparam.packageName) return
+        if (General.PACKAGE_NAME != lpparam.packageName || !RuntimeIdentityGuard.isPackageReady()) return
         handleHookLogic(
             lpparam.classLoader,
             lpparam.packageName,
-            lpparam.applicationInfo.sourceDir
+            lpparam.applicationInfo.sourceDir,
         )
     }
 
     @SuppressLint("PrivateApi")
-    private fun handleHookLogic(loader: ClassLoader?, packageName: String, apkPath: String) {
+    private fun handleHookLogic(
+        loader: ClassLoader?,
+        packageName: String,
+        apkPath: String,
+    ) {
         val activeLoader = loader ?: return
         classLoader = activeLoader
         finalProcessName = processName
-        val frameworkInfo = resolveCurrentFrameworkInfo(activeLoader)
+        val frameworkInfo = resolveCurrentFrameworkInfo()
         val framework = frameworkInfo.displayName
-        if (frameworkInfo.category == ModuleStatus.FrameworkCategory.PATCH_EMBEDDED) {
+        val frameworkApiVersion = getFrameworkRuntimeInfo()?.apiVersion ?: 0
+        if (!ModuleStatus.isSupportedLsposedFramework(framework, frameworkApiVersion)) {
             remotePreferences = null
-            ModuleStatusReporter.updateNow(framework = framework, packageName = packageName, reason = "embedded_patch_blocked")
-            record(TAG, "⛔ 检测到 $framework 内置打包/补丁注入，停止安装 Hook")
+            ModuleStatusReporter.updateNow(framework = framework, packageName = packageName, reason = "unsupported_libxposed_runtime")
+            record(TAG, "⛔ 检测到不受支持的 $framework 运行时 (API $frameworkApiVersion)，停止安装 Hook")
             return
         }
 
         // 1. 初始化配置读取
         remotePreferences = loadRemotePreferences(framework)
 
-        // 2. 进程检查
+        // 2. 进程检查。Lite 子进程只安装自然 RPC 抓包，不得进入任务运行时。
+        if (shouldHookCaptureOnlyProcess()) {
+            installCaptureOnlyHooks(activeLoader)
+            hookCaptureOnlyProcessAttach()
+            return
+        }
         if (!shouldHookProcess()) return
 
         init(Files.CONFIG_DIR)
@@ -171,25 +188,25 @@ class ApplicationHook {
     private fun loadRemotePreferences(framework: String): SharedPreferences? {
         val frameworkProperties = getFrameworkRuntimeInfo()?.properties
         if (frameworkProperties == null) {
-            logFramework(android.util.Log.INFO, "无法读取 $framework 的 capability，跳过远程偏好读取")
+            Log.runtime(TAG, "无法读取 $framework 的 capability，跳过远程偏好读取")
             return null
         }
         if (frameworkProperties.and(XposedInterface.PROP_CAP_REMOTE) == 0L) {
-            logFramework(android.util.Log.INFO, "$framework 未声明 remote capability，跳过远程偏好读取")
+            Log.runtime(TAG, "$framework 未声明 remote capability，跳过远程偏好读取")
             return null
         }
         return runCatching {
             requireXposedInterface().getRemotePreferences(SesameApplication.PREFERENCES_KEY)
         }.onFailure {
-            logFramework(android.util.Log.WARN, "读取远程偏好失败: ${it.message}", it)
+            logFrameworkWarning("读取远程偏好失败: ${it.message}", it)
         }.getOrNull()
     }
 
-    private fun shouldHookProcess(): Boolean {
-        val isMainProcess = General.PACKAGE_NAME == finalProcessName
-        return isMainProcess
-//            record(TAG, "跳过辅助进程: $finalProcessName")
-    }
+    private fun shouldHookProcess(): Boolean =
+        RuntimeIdentityGuard.isMainProcess() && RuntimeIdentityGuard.isPackageReady()
+
+    private fun shouldHookCaptureOnlyProcess(): Boolean =
+        RuntimeIdentityGuard.isCaptureOnlyProcess() && RuntimeIdentityGuard.isPackageReady()
 
     private fun initReflection(loader: ClassLoader) {
         try {
@@ -200,10 +217,54 @@ class ApplicationHook {
         }
 
         try {
-            @SuppressLint("PrivateApi") val loadedApkClass = loader.loadClass(ApplicationHookConstants.AlipayClasses.LOADED_APK)
+            @SuppressLint("PrivateApi")
+            val loadedApkClass = loader.loadClass(ApplicationHookConstants.AlipayClasses.LOADED_APK)
             deoptimizeClass(loadedApkClass)
         } catch (_: Throwable) {
             // ignore
+        }
+    }
+
+    private fun installCaptureOnlyHooks(activeLoader: ClassLoader) {
+        val installed = RpcTrafficCapture.installForCaptureOnlyProcess(activeLoader)
+        val application = runCatching {
+            val activityThread = Class.forName("android.app.ActivityThread")
+            activityThread.getDeclaredMethod("currentApplication").invoke(null) as? Application
+        }.getOrNull()
+        application?.let { Log.init(it) }
+        Log.runtime(
+            TAG,
+            "capture_only_hook_install: process=$finalProcessName installed=$installed applicationReady=${application != null}",
+        )
+    }
+
+    private fun hookCaptureOnlyProcessAttach() {
+        try {
+            val attachMethod = findMethod(Application::class.java, "attach", Context::class.java)
+            requireXposedInterface().hook(attachMethod).intercept { chain ->
+                val result = chain.proceed()
+                val context = chain.args[0] as? Context ?: return@intercept result
+                val identityDecision = RuntimeIdentityGuard.verifyApplicationAttach(context)
+                if (!identityDecision.accepted || !RuntimeIdentityGuard.isCaptureOnlyProcess()) {
+                    val reasonCode = identityDecision.reasonCode ?: "identity_not_verified"
+                    val message =
+                        "capture_instance_rejected: $reasonCode process=$processName process_role=capture_only"
+                    logFrameworkWarning(message)
+                    android.util.Log.w(TAG, message)
+                    return@intercept result
+                }
+                XposedEnv.runtimeIdentity = RuntimeIdentityGuard.trustedIdentity()
+                Log.init(context)
+                val activeLoader = classLoader ?: return@intercept result
+                val installed = RpcTrafficCapture.installForCaptureOnlyProcess(activeLoader)
+                Log.runtime(
+                    TAG,
+                    "capture_only_hook_ready: process=$finalProcessName installed=$installed",
+                )
+                result
+            }
+        } catch (e: Exception) {
+            Log.printStackTrace(TAG, "Capture-only attach hook failed", e)
         }
     }
 
@@ -214,21 +275,31 @@ class ApplicationHook {
                 val result = chain.proceed()
                 val context = chain.args[0] as? Context ?: return@intercept result
                 val application = chain.getThisObject() as? Application
+                val identityDecision = RuntimeIdentityGuard.verifyApplicationAttach(context)
+                if (!identityDecision.accepted) {
+                    val reasonCode = identityDecision.reasonCode ?: "identity_not_verified"
+                    val message = "instance_rejected: $reasonCode process=$processName process_role=main"
+                    logFrameworkWarning(message)
+                    android.util.Log.w(TAG, message)
+                    return@intercept result
+                }
+                XposedEnv.runtimeIdentity = RuntimeIdentityGuard.trustedIdentity()
                 appContext = context
                 mainHandler = Handler(Looper.getMainLooper())
                 Log.init(context)
-                ensureScheduler()
-                application?.let { PageStructureSnapshotter.install(it) }
-                RpcTrafficCapture.install(classLoader!!)
+                // Application.attach 位于宿主启动主路径；反射安装和调度恢复延后到入口线程，
+                // 避免慢设备在 attach 阶段被这些非必要初始化阻塞。
+                ApplicationHookConstants.submitEntry("application_attach_init") {
+                    ensureScheduler()
+                    application?.let { PageStructureSnapshotter.install(it) }
+                    RpcTrafficCapture.install(classLoader!!)
 
-                SecurityBodyHelper.init(classLoader!!)
-                AlipayMiniMarkHelper.init(classLoader!!)
-                LocationHelper.init(classLoader!!)
-                AuthCodeHelper.init(classLoader!!)
+                    SecurityBodyHelper.init(classLoader!!)
+                    AlipayMiniMarkHelper.init(classLoader!!)
+                    LocationHelper.init(classLoader!!)
+                    AuthCodeHelper.init(classLoader!!)
 
-                initVersionInfo(packageName)
-                if (VersionHook.hasVersion() && alipayVersion.compareTo(AlipayVersion("10.7.26.8100")) == 0) {
-                    HookUtil.bypassAccountLimit(classLoader!!)
+                    initVersionInfo(packageName)
                 }
                 result
             }
@@ -244,17 +315,23 @@ class ApplicationHook {
         if (!persistentAlarmLaunch) return false
 
         ApplicationResumeCoordinator.recordReOpenAppLaunch()
-        pendingPersistentLaunchScheduleId = activityIntent.getStringExtra(SystemWakeScheduler.EXTRA_SCHEDULE_ID)
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
+        val scheduleId =
+            activityIntent
+                .getStringExtra(SystemWakeScheduler.EXTRA_SCHEDULE_ID)
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+        pendingPersistentLaunchScheduleId = scheduleId
+        pendingPersistentLaunchBatch =
+            activityIntent.getBooleanExtra(SystemWakeScheduler.EXTRA_PLANNED_BATCH, false)
+        pendingPersistentLaunchConfirmationAt = activityIntent.getLongExtra(SystemWakeScheduler.EXTRA_CONFIRMATION_AT, 0L)
+        activityIntent.removeExtra(SystemWakeScheduler.EXTRA_CONFIRMATION_AT)
         activityIntent.removeExtra(SystemWakeScheduler.EXTRA_PERSISTENT_ALARM_LAUNCH)
         activityIntent.removeExtra(SystemWakeScheduler.EXTRA_SCHEDULE_ID)
+        activityIntent.removeExtra(SystemWakeScheduler.EXTRA_PLANNED_BATCH)
         return true
     }
 
-    private fun consumePersistentAlarmLaunch(activity: android.app.Activity?): Boolean {
-        return consumePersistentAlarmLaunch(activity?.intent)
-    }
+    private fun consumePersistentAlarmLaunch(activity: android.app.Activity?): Boolean = consumePersistentAlarmLaunch(activity?.intent)
 
     private fun handlePersistentAlarmLaunch(source: String) {
         if (!init) {
@@ -269,7 +346,20 @@ class ApplicationHook {
         if (isReadyForExec() && context != null) {
             record(TAG, "持久调度唤醒目标应用，检查到期任务: $source")
             val launchScheduleId = pendingPersistentLaunchScheduleId
+            if (pendingPersistentLaunchBatch) {
+                val dueCount = PersistentScheduleRegistry.fireDueSchedules(context, "$source:planned_batch")
+                record(TAG, "持久调度物理唤醒批量路由完成，计划数=$dueCount")
+                pendingPersistentLaunchBatch = false
+                pendingPersistentLaunchScheduleId = null
+                return
+            }
             if (!launchScheduleId.isNullOrBlank()) {
+                val confirmed = ScheduledTaskRouter.confirmTargetLaunch(launchScheduleId, pendingPersistentLaunchConfirmationAt)
+                pendingPersistentLaunchConfirmationAt = 0L
+                if (!confirmed) {
+                    pendingPersistentLaunchScheduleId = null
+                    return
+                }
                 val schedule = PersistentScheduleRegistry.get(launchScheduleId)
                 if (schedule != null) {
                     if (ScheduledTaskRouter.fire(context, schedule, source)) {
@@ -283,7 +373,7 @@ class ApplicationHook {
             }
             UnifiedScheduler.reconcilePersistentSchedules(
                 context,
-                mode = PersistentReconcileMode.FIRE_ALARM_DUE
+                mode = PersistentReconcileMode.FIRE_ALARM_DUE,
             )
         } else {
             record(TAG, "持久调度唤醒目标应用但工作流未就绪[$source]: ${readinessSummary()}")
@@ -301,59 +391,62 @@ class ApplicationHook {
                     consumePersistentAlarmLaunch(chain.getThisObject() as? android.app.Activity)
                 ApplicationResumeCoordinator.markHostAppForegrounded()
                 ApplicationHookConstants.submitEntry("launcher_onResume") {
-                            val targetUid = HookUtil.getUserId(classLoader!!) ?: run {
-                                show("用户未登录")
-                                return@submitEntry
-                            }
+                    val targetUid =
+                        HookUtil.getUserId(classLoader!!) ?: run {
+                            onHostAccountUnavailable("launcher_onResume")
+                            show("用户未登录")
+                            return@submitEntry
+                        }
 
-                            if (!init) {
-                                if (persistentAlarmLaunch) {
-                                    handlePersistentAlarmLaunch("launcher_onResume:init")
-                                } else if (initHandler("onResume")) {
-                                    init = true
-                                }
-                                return@submitEntry
-                            }
+                    if (!init) {
+                        if (persistentAlarmLaunch) {
+                            handlePersistentAlarmLaunch("launcher_onResume:init")
+                        } else if (initHandler("onResume")) {
+                            init = true
+                        }
+                        return@submitEntry
+                    }
 
-                            val activeSessionUserId = AccountSessionCoordinator.currentUserId() ?: currentUid
-                            if (targetUid != activeSessionUserId) {
-                                if (activeSessionUserId != null) {
-                                    initHandler("user_switch")
-                                    lastExecTime = 0
-                                    show("用户已切换")
-                                    return@submitEntry
-                                }
-                                refreshFriendsFromAlipayIfNeeded(targetUid, force = false, source = "launcher_onResume")
-                            }
+                    val activeSessionUserId = AccountSessionCoordinator.currentUserId() ?: currentUid
+                    if (targetUid != activeSessionUserId) {
+                        if (activeSessionUserId != null) {
+                            initHandler("user_switch")
+                            lastExecTime = 0
+                            show("用户已切换")
+                            return@submitEntry
+                        }
+                        refreshFriendsFromAlipayIfNeeded(targetUid, force = false, source = "launcher_onResume")
+                    }
 
-                            val recoveredFromOffline = ApplicationResumeCoordinator.tryRecoverOffline("onResume")
-                            if (persistentAlarmLaunch) {
-                                reconcilePersistentAlarmLaunch("launcher_onResume")
-                            }
+                    val recoveredFromOffline = ApplicationResumeCoordinator.tryRecoverOffline("onResume")
+                    if (persistentAlarmLaunch) {
+                        reconcilePersistentAlarmLaunch("launcher_onResume")
+                    }
 
-                            val resumeAt = System.currentTimeMillis()
-                            val resumedFromBackground = ApplicationResumeCoordinator.consumeHostAppBackgrounded()
-                            val moduleInitiatedResume = ApplicationResumeCoordinator.consumeModuleForegroundResume(resumeAt)
-                            val recentlyReopenedByModule = ApplicationResumeCoordinator.wasRecentlyReopenedByModule(resumeAt)
-                            if (
-                                resumedFromBackground &&
-                                !moduleInitiatedResume &&
-                                !recentlyReopenedByModule &&
-                                !recoveredFromOffline &&
-                                manualTriggerAutoSchedule.value == true
-                            ) {
-                                record(TAG, "检测到手动回到目标应用，补触发一次任务执行")
-                                ApplicationHookCore.requestExecution(
-                                    ApplicationHookConstants.TriggerInfo(
-                                        type = ApplicationHookConstants.TriggerType.ON_RESUME,
-                                        priority = ApplicationHookConstants.TriggerPriority.NORMAL,
-                                        reason = "manual_on_resume",
-                                        dedupeKey = "manual_on_resume",
-                                        ownerUserId = AccountSessionCoordinator.currentUserId(),
-                                        sessionEpoch = AccountSessionCoordinator.currentSessionEpoch()
-                                    )
-                                )
-                            }
+                    val resumeAt = System.currentTimeMillis()
+                    val resumedFromBackground = ApplicationResumeCoordinator.consumeHostAppBackgrounded()
+                    val moduleInitiatedResume = ApplicationResumeCoordinator.consumeModuleForegroundResume(resumeAt)
+                    val recentlyReopenedByModule = ApplicationResumeCoordinator.wasRecentlyReopenedByModule(resumeAt)
+                    if (
+                        resumedFromBackground &&
+                        !persistentAlarmLaunch &&
+                        !moduleInitiatedResume &&
+                        !recentlyReopenedByModule &&
+                        !recoveredFromOffline &&
+                        manualTriggerAutoSchedule.value == true
+                    ) {
+                        record(TAG, "检测到手动回到目标应用，补触发一次任务执行")
+                        ApplicationHookCore.requestExecution(
+                            ApplicationHookConstants.TriggerInfo(
+                                type = ApplicationHookConstants.TriggerType.ON_RESUME,
+                                priority = ApplicationHookConstants.TriggerPriority.NORMAL,
+                                reason = "manual_on_resume",
+                                dedupeKey = "manual_on_resume",
+                                ownerUserId = AccountSessionCoordinator.currentUserId(),
+                                sessionEpoch = AccountSessionCoordinator.currentSessionEpoch(),
+                            ),
+                        )
+                    }
                 }
                 result
             }
@@ -377,18 +470,18 @@ class ApplicationHook {
                     consumePersistentAlarmLaunch(chain.getThisObject() as? android.app.Activity)
                 ApplicationResumeCoordinator.markHostAppForegrounded()
                 ApplicationHookConstants.submitEntry("login_onResume") {
-                            if (!init) {
-                                if (persistentAlarmLaunch) {
-                                    handlePersistentAlarmLaunch("login_onResume:init")
-                                } else if (initHandler("onResume")) {
-                                    init = true
-                                }
-                                return@submitEntry
-                            }
-                            if (persistentAlarmLaunch) {
-                                reconcilePersistentAlarmLaunch("login_onResume")
-                            }
-                            ApplicationResumeCoordinator.tryRecoverOffline("login.onResume")
+                    if (!init) {
+                        if (persistentAlarmLaunch) {
+                            handlePersistentAlarmLaunch("login_onResume:init")
+                        } else if (initHandler("onResume")) {
+                            init = true
+                        }
+                        return@submitEntry
+                    }
+                    if (persistentAlarmLaunch) {
+                        reconcilePersistentAlarmLaunch("login_onResume")
+                    }
+                    ApplicationResumeCoordinator.tryRecoverOffline("login.onResume")
                 }
                 result
             }
@@ -397,7 +490,10 @@ class ApplicationHook {
         }
     }
 
-    private fun hookPersistentAlarmNewIntent(activityClass: Class<*>, source: String) {
+    private fun hookPersistentAlarmNewIntent(
+        activityClass: Class<*>,
+        source: String,
+    ) {
         runCatching { findMethod(activityClass, "onNewIntent", Intent::class.java) }
             .onSuccess { method ->
                 requireXposedInterface().hook(method).intercept { chain ->
@@ -418,8 +514,7 @@ class ApplicationHook {
                     }
                     result
                 }
-            }
-            .onFailure {
+            }.onFailure {
                 record(TAG, "未找到 $source 钩子入口: ${it.message}")
             }
     }
@@ -437,19 +532,22 @@ class ApplicationHook {
 
                 service = appService
                 appContext = appService.applicationContext
-                ensureScheduler()
-
-                ensureMainTask()
-                dayCalendar = Calendar.getInstance()
-                val initReason = pendingInitReason ?: "service_onCreate"
-                if (!init || pendingInit) {
-                    if (initHandler(initReason)) {
-                        init = true
+                // 宿主 Service 生命周期回调必须快速返回；完整初始化仅在入口后台线程执行。
+                ApplicationHookConstants.submitEntry("service_onCreate") {
+                    if (service !== appService) return@submitEntry
+                    ensureScheduler()
+                    ensureMainTask()
+                    dayCalendar = Calendar.getInstance()
+                    val initReason = pendingInitReason ?: "service_onCreate"
+                    if (!init || pendingInit) {
+                        if (initHandler(initReason)) {
+                            init = true
+                        }
+                    } else {
+                        // 已经初始化过，避免重复初始化导致重复 Toast、重置线程池等副作用
+                        pendingInit = false
+                        pendingInitReason = null
                     }
-                } else {
-                    // 已经初始化过，避免重复初始化导致重复 Toast、重置线程池等副作用
-                    pendingInit = false
-                    pendingInitReason = null
                 }
                 result
             }
@@ -459,16 +557,14 @@ class ApplicationHook {
                 val result = chain.proceed()
                 val s = chain.getThisObject() as? Service ?: return@intercept result
                 if (General.CURRENT_USING_SERVICE == s.javaClass.getCanonicalName()) {
-                        // TODO: 目前观察到用户手动划掉目标应用后台时，也会走到这里。
-                        // 如果直接 restartByBroadcast()/reOpenApp()，会把“用户主动退出”误判成“异常退出需要恢复”，
-                        // 进而出现目标应用/模块后台被反复复活的问题。后续可增加独立配置开关，
-                        // 由用户决定“宿主前台服务销毁后是否自动恢复目标应用/执行链路”。
-                        updateRunningStatus("目标应用前台服务被销毁")
-                        destroyHandler()
-                        service = null
-                        mainTask = null
-                        record(TAG, "🛑 目标应用前台服务已销毁，停止当前模块运行，不再自动重启目标应用")
-                    }
+                    // TODO: 目前观察到用户手动划掉目标应用后台时，也会走到这里。
+                    // 如果直接 reOpenApp()，会把“用户主动退出”误判成“异常退出需要恢复”，
+                    // 进而出现目标应用/模块后台被反复复活的问题。后续可增加独立配置开关，
+                    // 由用户决定“宿主前台服务销毁后是否自动恢复目标应用/执行链路”。
+                    updateRunningStatus("目标应用前台服务被销毁")
+                    destroyHandler()
+                    record(TAG, "🛑 目标应用前台服务已销毁，已投递后台停止任务，不再自动重启目标应用")
+                }
                 result
             }
         } catch (t: Throwable) {
@@ -492,7 +588,10 @@ class ApplicationHook {
 
     // --- 广播接收器 ---
     internal class AlipayBroadcastReceiver : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent) {
+        override fun onReceive(
+            context: Context?,
+            intent: Intent,
+        ) {
             ApplicationBroadcastDispatcher.handleReceive(context, intent)
         }
     }
@@ -503,7 +602,7 @@ class ApplicationHook {
             val version: String?,
             val versionCode: Long?,
             val apiVersion: Int?,
-            val properties: Long?
+            val properties: Long?,
         )
 
         const val TAG: String = "ApplicationHook" // 简化TAG
@@ -542,6 +641,8 @@ class ApplicationHook {
 
         @Volatile
         private var pendingInitReason: String? = null
+        @Volatile
+        private var sessionShutdownPending = false
 
         @Volatile
         private var rootCheckInProgress = false
@@ -565,7 +666,10 @@ class ApplicationHook {
             val shouldResume: Boolean,
             val mainTaskRunning: Boolean,
             val pendingTriggers: Int,
-            val schedulerTasks: Int
+            val schedulerTasks: Int,
+            val poll: PersistentSchedule?,
+            val intervalMs: Int,
+            val execTimes: String?,
         )
 
         @Volatile
@@ -573,6 +677,12 @@ class ApplicationHook {
 
         @Volatile
         private var pendingPersistentLaunchScheduleId: String? = null
+
+        @Volatile
+        private var pendingPersistentLaunchBatch: Boolean = false
+
+        @Volatile
+        private var pendingPersistentLaunchConfirmationAt: Long = 0L
 
         private fun ensureMainTask() {
             if (mainTask == null) {
@@ -582,10 +692,13 @@ class ApplicationHook {
 
         internal fun isReadyForExec(): Boolean {
             val session = AccountSessionCoordinator.currentSession()
-            return init &&
+            return RuntimeIdentityGuard.isTrustedForExecution() &&
+                AccountSlotRegistry.isExecutableUser(session?.userId) &&
+                init &&
                 Config.isLoaded() &&
                 service != null &&
                 WorkflowRootGuard.hasGrantedRoot() &&
+                WorkflowRootGuard.isExecutionAllowed() &&
                 !ApplicationHookConstants.isOffline() &&
                 session?.workflowAllowed == true &&
                 session.userId == currentUid
@@ -617,11 +730,12 @@ class ApplicationHook {
                 return 0
             }
 
-            val removed = ApplicationHookConstants.removePendingTriggers("alarm_poll_covered_by_main_task") { trigger ->
-                trigger.type == ApplicationHookConstants.TriggerType.ALARM_POLL &&
-                    trigger.priority == ApplicationHookConstants.TriggerPriority.LOW &&
-                    trigger.createdAtMs <= runCompletedAt
-            }
+            val removed =
+                ApplicationHookConstants.removePendingTriggers("alarm_poll_covered_by_main_task") { trigger ->
+                    trigger.type == ApplicationHookConstants.TriggerType.ALARM_POLL &&
+                        trigger.priority == ApplicationHookConstants.TriggerPriority.LOW &&
+                        trigger.createdAtMs <= runCompletedAt
+                }
             val context = appContext
             removed.forEach { trigger ->
                 trigger.persistentScheduleId
@@ -631,112 +745,131 @@ class ApplicationHook {
             return removed.size
         }
 
-        private fun shouldCaptureReloadState(reason: String): Boolean {
-            return reason == "config_reload" || reason == "broadcast_restart"
-        }
+        private fun shouldCaptureReloadState(reason: String): Boolean = reason == "config_reload" || reason == "broadcast_restart"
 
         private fun captureReloadResumeDecision(reason: String) {
             val running = mainTask?.isRunning == true
             val pending = ApplicationHookConstants.pendingTriggerCount()
             val scheduled = UnifiedScheduler.activeTaskCount()
-            val decision = ReloadResumeDecision(
-                reason = reason,
-                // Scheduled timers also exist in the normal waiting state; they must not turn
-                // a config reload into an immediate main workflow run.
-                shouldResume = running || pending > 0,
-                mainTaskRunning = running,
-                pendingTriggers = pending,
-                schedulerTasks = scheduled
-            )
+            val session = AccountSessionCoordinator.currentSession()
+            val poll = PersistentScheduleRegistry.listFresh().filter {
+                it.kind == PersistentScheduleKind.GLOBAL_POLL &&
+                    it.state == PersistentScheduleState.SCHEDULED &&
+                    it.ownerUserId == session?.userId && it.sessionEpoch == session?.sessionEpoch
+            }.minByOrNull { it.triggerAtMs }
+            val decision =
+                ReloadResumeDecision(
+                    reason = reason,
+                    // Scheduled timers also exist in the normal waiting state; they must not turn
+                    // a config reload into an immediate main workflow run.
+                    shouldResume = running || pending > 0,
+                    mainTaskRunning = running,
+                    pendingTriggers = pending,
+                    schedulerTasks = scheduled,
+                    poll = poll,
+                    intervalMs = checkInterval.value ?: 0,
+                    execTimes = execAtTimeList.value,
+                )
             reloadResumeDecision = decision
             record(
                 TAG,
                 "reload snapshot: reason=$reason shouldResume=${decision.shouldResume} " +
-                    "mainTaskRunning=$running pending=$pending schedulerTasks=$scheduled"
+                    "mainTaskRunning=$running pending=$pending schedulerTasks=$scheduled",
             )
         }
 
-        internal fun consumeReloadResumeDecision(reason: String): Boolean {
+        internal fun resumeSchedulingAfterReload(reason: String): Boolean {
             val decision = reloadResumeDecision
             if (decision == null || decision.reason != reason) {
                 if (shouldCaptureReloadState(reason)) {
-                    record(TAG, "reload completed without snapshot, keep idle: reason=$reason")
+                    record(TAG, "reload completed without snapshot, rebuild next poll: reason=$reason")
+                    scheduleNextExecutionInternal(System.currentTimeMillis())
                 }
                 return false
             }
             reloadResumeDecision = null
             if (!decision.shouldResume) {
+                val now = System.currentTimeMillis()
+                val preservedPoll = decision.poll?.takeIf {
+                    it.ownerUserId == AccountSessionCoordinator.currentUserId() &&
+                        now <= it.deadlineAtMs() &&
+                        decision.intervalMs == (checkInterval.value ?: 0) &&
+                        decision.execTimes == execAtTimeList.value
+                }
+                scheduleNextExecutionInternal(now, preservedPoll)
                 record(
                     TAG,
                     "reload idle preserved: reason=$reason mainTaskRunning=${decision.mainTaskRunning} " +
-                        "pending=${decision.pendingTriggers} schedulerTasks=${decision.schedulerTasks}"
+                        "pending=${decision.pendingTriggers} schedulerTasks=${decision.schedulerTasks}",
                 )
                 return false
             }
             record(
                 TAG,
                 "reload resume workflow: reason=$reason mainTaskRunning=${decision.mainTaskRunning} " +
-                    "pending=${decision.pendingTriggers} schedulerTasks=${decision.schedulerTasks}"
+                    "pending=${decision.pendingTriggers} schedulerTasks=${decision.schedulerTasks}",
             )
             return true
         }
 
-        internal fun restartWorkflow(reason: String): Boolean = initHandler(reason)
+        internal fun restartWorkflow(reason: String, onComplete: ((Boolean) -> Unit)? = null): Boolean =
+            initHandler(reason, onComplete = onComplete)
 
         internal fun ensureLegalAcceptedForWorkflow(): Boolean = ensureLegalAcceptanceForWorkflow()
 
         internal fun refreshFriendsFromAlipayIfNeeded(
             userId: String,
             force: Boolean,
-            source: String
+            source: String,
         ): HookUtil.FriendRefreshResult {
             val safeUserId = userId.trim()
             if (safeUserId.isEmpty()) {
                 return HookUtil.FriendRefreshResult(success = false, message = "刷新好友失败：账号为空")
             }
-            val loader = classLoader ?: return HookUtil.FriendRefreshResult(
-                success = false,
-                userId = safeUserId,
-                message = "刷新好友失败：Hook classLoader 不可用"
-            )
-
-            UserMap.setCurrentUserId(safeUserId)
-            runCatching { UserMap.load(safeUserId) }.onFailure {
-                Log.printStackTrace(TAG, "刷新好友前加载本地好友快照失败", it)
+            if (!WorkflowRootGuard.isExecutionAllowed()) {
+                return HookUtil.FriendRefreshResult(success = false, message = "必需权限或使用协议未就绪，无法刷新好友")
             }
-            runCatching { load(safeUserId, false) }.onFailure {
-                Log.printStackTrace(TAG, "刷新好友前加载每日状态失败", it)
-            }
-
-            if (!force && Status.hasFlagToday(StatusFlags.FLAG_FRIEND_CENTER_SYNC_TODAY)) {
-                val config = FriendRepository.current(safeUserId)
-                AccountSessionCoordinator.ensureActiveUserSnapshot(safeUserId, loader)
-                val message = "好友中心今日已刷新，跳过自动同步[$source]"
-                record(TAG, message)
-                return HookUtil.FriendRefreshResult(
-                    success = true,
+            val loader =
+                classLoader ?: return HookUtil.FriendRefreshResult(
+                    success = false,
                     userId = safeUserId,
-                    message = message,
-                    profiles = config.profiles.size,
-                    groups = config.groups.size
+                    message = "刷新好友失败：Hook classLoader 不可用",
                 )
-            }
 
-            val result = HookUtil.hookUser(loader)
-            AccountSessionCoordinator.ensureActiveUserSnapshot(safeUserId, loader)
-            if (result.success) {
-                Status.setFlagToday(StatusFlags.FLAG_FRIEND_CENTER_SYNC_TODAY)
-                record(TAG, "好友中心刷新完成[$source]: ${result.message}")
-            } else {
-                record(TAG, "好友中心刷新未完成[$source]: ${result.message}")
+            val session = AccountSessionCoordinator.currentSession()
+                ?: return HookUtil.FriendRefreshResult(false, safeUserId, "当前账号会话未就绪")
+            val identity = AccountSessionIdentity(safeUserId, session.sessionEpoch)
+            return try {
+                AccountSessionCoordinator.withCurrentSession(identity) {
+                    check(currentUid == safeUserId && HookUtil.getUserId(loader) == safeUserId) { "目标账号未登录" }
+                    UserMap.load(safeUserId)
+                    load(safeUserId, false)
+                }
+                if (!force && Status.hasFlagToday(StatusFlags.FLAG_FRIEND_CENTER_SYNC_TODAY)) {
+                    val config = FriendRepository.current(safeUserId)
+                    return HookUtil.FriendRefreshResult(
+                        true, safeUserId, "好友中心今日已刷新，跳过自动同步[$source]",
+                        config.profiles.size, config.groups.size
+                    )
+                }
+                val result = HookUtil.hookUser(loader, identity)
+                if (result.success && result.userId == safeUserId) {
+                    AccountSessionCoordinator.withCurrentSession(identity) {
+                        check(currentUid == safeUserId && HookUtil.getUserId(loader) == safeUserId) { "刷新后账号已变化" }
+                        Status.setFlagToday(StatusFlags.FLAG_FRIEND_CENTER_SYNC_TODAY, expectedUserId = safeUserId)
+                    }
+                }
+                record(TAG, "好友中心刷新[$source]: ${result.message}")
+                result
+            } catch (e: Exception) {
+                Log.printStackTrace(TAG, "好友刷新失败", e)
+                HookUtil.FriendRefreshResult(false, safeUserId, "好友刷新未完成：${e.message}")
             }
-            return result
         }
 
         /**
          * 冷启动首次好友实时同步的后移延时(毫秒)。
-         * 用于规避目标应用社交库(AliAccountDaoOp)在冷启动期未加载完时 getAllFriends() 返回“非空但不完整”
-         * 快照被误判为可信全量。可按实测调大；现有“重新登录”延时为 20s 作参考。
+         * 等待社交库初始化以减少空结果；延时不代表缓存完整，缺失项不会据此判定失效。
          */
         private const val FRIEND_CENTER_FIRST_SYNC_DEFER_MS: Long = 30_000L
         private val MIN_SUPPORTED_RPC_VERSION = AlipayVersion("10.3.96.8100")
@@ -745,6 +878,7 @@ class ApplicationHook {
             val currentVersion = alipayVersion
             if (currentVersion.versionString.isBlank()) {
                 record(TAG, "⚠️ 无法识别目标应用版本，继续尝试初始化 RPC")
+                Log.w(TAG, "host_version_unknown: 无法识别目标应用版本，继续尝试初始化 RPC")
                 return true
             }
             if (currentVersion >= MIN_SUPPORTED_RPC_VERSION) {
@@ -754,6 +888,7 @@ class ApplicationHook {
             val message = "目标应用版本过低，不支持当前 RPC 结构，最低版本 ${MIN_SUPPORTED_RPC_VERSION.versionString}"
             record(TAG, message)
             Log.runtime(TAG, "rpc unsupported host version: current=$currentVersion min=${MIN_SUPPORTED_RPC_VERSION.versionString}")
+            Log.w(TAG, "rpc unsupported host version: current=$currentVersion min=${MIN_SUPPORTED_RPC_VERSION.versionString}")
             updateRunningStatus(message)
             ApplicationHookConstants.clearPendingTriggers("unsupported_host_version")
             AccountSessionCoordinator.blockWorkflow(appContext, "unsupported_host_version")
@@ -764,12 +899,16 @@ class ApplicationHook {
          * 后移“从目标应用侧获取好友实时快照”的时机：init 阶段不再同步拉取，改为延时后在后台执行，
          * 让社交库就绪概率更高时再读取。手动刷新(force=true)走广播同步路径，不经此后移。
          */
-        private fun scheduleDeferredFriendCenterSync(userId: String, reason: String) {
+        private fun scheduleDeferredFriendCenterSync(
+            userId: String,
+            reason: String,
+        ) {
             val safeUserId = userId.trim()
             if (safeUserId.isEmpty()) return
+            val expectedEpoch = AccountSessionCoordinator.currentSessionEpoch()
             UnifiedScheduler.scheduleLongDelay(
                 FRIEND_CENTER_FIRST_SYNC_DEFER_MS,
-                "好友中心首次同步"
+                "好友中心首次同步",
             ) {
                 // scheduleLongDelay 系统计时模式在 Main 执行，这里只做轻量派发，
                 // 把 hookUser(反射+DB读+JSON写)放到后台单线程入口执行，避免阻塞主线程。
@@ -777,10 +916,11 @@ class ApplicationHook {
                     // 后移期间账号可能切换 → 执行前重新校验当前账号，避免给旧账号误同步。
                     val activeUserId = AccountSessionCoordinator.currentUserId() ?: currentUid
                     val liveUserId = runCatching { classLoader?.let { HookUtil.getUserId(it) } }.getOrNull()
-                    if (safeUserId != activeUserId || (liveUserId != null && liveUserId != safeUserId)) {
+                    if (safeUserId != activeUserId || liveUserId != safeUserId ||
+                        !AccountSessionCoordinator.isCurrentSession(safeUserId, expectedEpoch)) {
                         record(
                             TAG,
-                            "好友中心首次同步已取消：账号已切换(expect=$safeUserId, active=$activeUserId, live=$liveUserId)"
+                            "好友中心首次同步已取消：账号已切换(expect=$safeUserId, active=$activeUserId, live=$liveUserId)",
                         )
                         return@submitEntry
                     }
@@ -808,17 +948,18 @@ class ApplicationHook {
         @Volatile
         private var mainTaskNextScheduleUpdatedAtMs: Long = 0
 
-        private val appVisibilityCallbacks = object : ComponentCallbacks2 {
-            override fun onTrimMemory(level: Int) {
-                if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
-                    ApplicationResumeCoordinator.markHostAppBackgrounded()
+        private val appVisibilityCallbacks =
+            object : ComponentCallbacks2 {
+                override fun onTrimMemory(level: Int) {
+                    if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+                        ApplicationResumeCoordinator.markHostAppBackgrounded()
+                    }
                 }
+
+                override fun onConfigurationChanged(newConfig: Configuration) = Unit
+
+                override fun onLowMemory() = Unit
             }
-
-            override fun onConfigurationChanged(newConfig: Configuration) = Unit
-
-            override fun onLowMemory() = Unit
-        }
 
         @Volatile
         private var appVisibilityCallbacksRegistered = false
@@ -828,76 +969,113 @@ class ApplicationHook {
             ApplicationHookUtils.resetToMidnight(dayCalendar!!)
         }
 
-        private suspend fun runMainTaskLogic() = withContext(Dispatchers.IO) {
-            try {
-                TaskLock().use { _ ->
-                    if (!init || !Config.isLoaded()) return@withContext
-                    if (!WorkflowRootGuard.hasRoot(forceRefresh = true, reason = "main_task")) {
-                        record(TAG, "⛔ 可用执行权限不可用，终止主任务执行")
-                        ApplicationHookConstants.clearPendingTriggers("root_denied")
-                        execute {
-                            destroyHandler()
+        private suspend fun runMainTaskLogic() =
+            withContext(Dispatchers.IO) {
+                var activePersistentScheduleId: String? = null
+                try {
+                    TaskLock().use { _ ->
+                        if (!init || !Config.isLoaded()) return@withContext
+                        if (!WorkflowRootGuard.hasRoot(forceRefresh = true, reason = "main_task")) {
+                            record(TAG, "⛔ 可用执行权限不可用，终止主任务执行")
+                            ApplicationHookConstants.clearPendingTriggers("root_denied")
+                            execute {
+                                destroyHandler()
+                            }
+                            return@withContext
                         }
-                        return@withContext
-                    }
-                    if (!ensureLegalAcceptanceForWorkflow()) {
-                        return@withContext
-                    }
+                        if (!ensureLegalAcceptanceForWorkflow()) {
+                            return@withContext
+                        }
 
-                    val trigger = ApplicationHookConstants.consumePendingTrigger()
-                    if (trigger != null && !AccountSessionCoordinator.shouldAcceptTrigger(trigger)) {
-                        record(TAG, "⏭ 丢弃过期触发: ${trigger.summary()}")
-                        return@withContext
-                    }
-                    record(TAG, "🎯 本次执行触发: ${trigger?.summary() ?: "<none>"}")
+                        val trigger = ApplicationHookConstants.consumePendingTrigger()
+                        activePersistentScheduleId = trigger?.persistentScheduleId?.takeIf { it.isNotBlank() }
+                        if (trigger != null && !AccountSessionCoordinator.shouldAcceptTrigger(trigger)) {
+                            record(TAG, "⏭ 丢弃过期触发: ${trigger.summary()}")
+                            return@withContext
+                        }
+                        record(TAG, "🎯 本次执行触发: ${trigger?.summary() ?: "<none>"}")
 
-                    val currentTime = System.currentTimeMillis()
-                    val elapsedSinceLastExec = currentTime - lastExecTime
-                    if (elapsedSinceLastExec < 2000) {
-                        record(TAG, "⚠️ 间隔过短，跳过")
-                        // 间隔保护仅用于防抖，重试应尽快（补足到 2s），而不是跟随执行间隔（如 50min）
-                        val retryDelayMs = (2000L - elapsedSinceLastExec).coerceAtLeast(200L)
-                        UnifiedScheduler.scheduleLongDelay(retryDelayMs, "间隔重试") {
-                            ApplicationHookCore.requestExecution(
-                                ApplicationHookConstants.TriggerInfo(
-                                    type = ApplicationHookConstants.TriggerType.INTERVAL_RETRY,
-                                    priority = ApplicationHookConstants.TriggerPriority.LOW,
-                                    dedupeKey = "interval_retry",
-                                    persistentScheduleId = trigger?.persistentScheduleId,
-                                    ownerUserId = trigger?.ownerUserId,
-                                    sessionEpoch = trigger?.sessionEpoch ?: 0L
+                        val currentTime = System.currentTimeMillis()
+                        val elapsedSinceLastExec = currentTime - lastExecTime
+                        if (elapsedSinceLastExec < 2000) {
+                            record(TAG, "⚠️ 间隔过短，跳过")
+                            // 间隔保护仅用于防抖，重试应尽快（补足到 2s），而不是跟随执行间隔（如 50min）
+                            val retryDelayMs = (2000L - elapsedSinceLastExec).coerceAtLeast(200L)
+                            UnifiedScheduler.scheduleLongDelay(retryDelayMs, "间隔重试") {
+                                ApplicationHookCore.requestExecution(
+                                    ApplicationHookConstants.TriggerInfo(
+                                        type = ApplicationHookConstants.TriggerType.INTERVAL_RETRY,
+                                        priority = ApplicationHookConstants.TriggerPriority.LOW,
+                                        dedupeKey = "interval_retry",
+                                        persistentScheduleId = trigger?.persistentScheduleId,
+                                        ownerUserId = trigger?.ownerUserId,
+                                        sessionEpoch = trigger?.sessionEpoch ?: 0L,
+                                    ),
                                 )
-                            )
+                            }
+                            return@withContext
                         }
-                        return@withContext
-                    }
 
-                    val currentUid = currentUid
-                    val targetUid = HookUtil.getUserId(classLoader!!)
-                    if (targetUid == null || targetUid != currentUid) {
-                        reOpenApp()
-                        return@withContext
-                    }
+                        val currentUid = currentUid
+                        val targetUid = HookUtil.getUserId(classLoader!!)
+                        if (targetUid == null || targetUid != currentUid) {
+                            activePersistentScheduleId?.let { scheduleId ->
+                                PersistentScheduleRegistry.rescheduleDeferred(appContext, scheduleId, "target_user_mismatch")
+                            }
+                            activePersistentScheduleId = null
+                            reOpenApp()
+                            return@withContext
+                        }
 
-                    lastExecTime = currentTime
-                    mainTaskRunStartedAtMs = currentTime
-                    mainTaskRunCompletedAtMs = 0
-                    trigger?.persistentScheduleId?.takeIf { it.isNotBlank() }?.let { scheduleId ->
-                        PersistentScheduleRegistry.markFired(appContext, scheduleId)
-                    }
+                        lastExecTime = currentTime
+                        mainTaskRunStartedAtMs = currentTime
+                        mainTaskRunCompletedAtMs = 0
+                        activePersistentScheduleId?.let { scheduleId ->
+                            PersistentScheduleRegistry.markRunning(scheduleId)
+                        }
 
-                    val models = Model.modelArray.filterNotNull()
-                    CoroutineTaskRunner(models).run(isFirst = true)
-                    mainTaskRunCompletedAtMs = System.currentTimeMillis()
+                        val models = Model.modelArray.filterNotNull()
+                        // 保持唤醒是显式的耗电策略；默认关闭时不应隐式持有覆盖整轮任务的 10 分钟 CPU 锁。
+                        // 定时 Receiver 仍以短锁完成路由，任务需要持续后台执行时由用户开启 stayAwake。
+                        val executionLease =
+                            appContext
+                                ?.takeIf { BaseModel.stayAwake.value == true }
+                                ?.let { context ->
+                                    WakeLockManager.acquire(
+                                        context = context,
+                                        timeoutMs = PersistentScheduleDefaults.TASK_EXECUTION_WAKELOCK_MS,
+                                        source = "main_task",
+                                        scheduleId = activePersistentScheduleId,
+                                    )
+                                }
+                        try {
+                            CoroutineTaskRunner(models).run(isFirst = true)
+                            mainTaskRunCompletedAtMs = System.currentTimeMillis()
+                        } finally {
+                            executionLease?.close()
+                        }
+                        activePersistentScheduleId?.let { scheduleId ->
+                            PersistentScheduleRegistry.markFired(appContext, scheduleId)
+                            activePersistentScheduleId = null
+                        }
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    activePersistentScheduleId?.let { scheduleId ->
+                        PersistentScheduleRegistry.markFailed(appContext, scheduleId, "main_task_cancelled")
+                    }
+                    throw e
+                } catch (e: IllegalStateException) {
+                    activePersistentScheduleId?.let { scheduleId ->
+                        PersistentScheduleRegistry.markFailed(appContext, scheduleId, e.message ?: e.javaClass.name)
+                    }
+                    record(TAG, "⚠️ " + e.message)
+                } catch (e: Exception) {
+                    activePersistentScheduleId?.let { scheduleId ->
+                        PersistentScheduleRegistry.markFailed(appContext, scheduleId, e.message ?: e.javaClass.name)
+                    }
+                    Log.printStackTrace(TAG, e)
                 }
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: IllegalStateException) {
-                record(TAG, "⚠️ " + e.message)
-            } catch (e: Exception) {
-                Log.printStackTrace(TAG, e)
             }
-        }
 
         // --- 辅助方法 ---
         private fun ensureScheduler() {
@@ -914,60 +1092,68 @@ class ApplicationHook {
             }
         }
 
-
-        fun scheduleNextExecutionInternal(baseTime: Long) {
+        fun scheduleNextExecutionInternal(baseTime: Long, preservedPoll: PersistentSchedule? = null) {
             try {
                 checkInactiveTime()
                 val checkInterval = checkInterval.value ?: 0
                 val execScheduleField = execAtTimeList
                 var delayMillis = checkInterval.toLong()
                 var targetTime: Long = 0
-                if (execScheduleField.isDisabled()) {
+                if (preservedPoll != null) {
+                    targetTime = preservedPoll.triggerAtMs
+                    record(TAG, "配置重载保留原轮询时间:${TimeUtil.getCommonDate(targetTime)}")
+                } else if (execScheduleField.isDisabled()) {
                     record(TAG, "定时执行已关闭，保留轮询间隔调度")
                 } else {
                     val intervalTargetTime = baseTime + checkInterval.toLong()
-                    val nextPointAt = TimeTriggerEvaluator.nextCheckpointAt(
-                        execScheduleField.getTriggerSpec(),
-                        baseTime
-                    )
-                    if (nextPointAt != null && nextPointAt < intervalTargetTime) {
+                    val nextPointAt =
+                        TimeTriggerEvaluator.nextCheckpointAt(
+                            execScheduleField.getTriggerSpec(),
+                            baseTime,
+                        )
+                    if (nextPointAt != null && nextPointAt <= intervalTargetTime) {
                         record(TAG, "设置定时执行:${TimeUtil.getCommonDate(nextPointAt)}")
                         targetTime = nextPointAt
                         delayMillis = targetTime - baseTime
                     }
                 }
-                nextExecutionTime = if (targetTime > 0) targetTime else (baseTime + delayMillis)
-                mainTaskNextScheduleUpdatedAtMs = System.currentTimeMillis()
+                val triggerAt = if (targetTime > 0) targetTime else (baseTime + delayMillis)
                 ensureScheduler()
                 val context = appContext
                 if (context != null) {
-                    val triggerAt = nextExecutionTime
                     val activeSession = AccountSessionCoordinator.currentSession()
-                    val schedule = UnifiedScheduler.schedulePersistentTrigger(
-                        context = context,
-                        name = "轮询任务",
-                        kind = PersistentScheduleKind.GLOBAL_POLL,
-                        triggerAtMs = triggerAt,
-                        dedupeKey = "alarm_poll",
-                        payloadJson = "{}",
-                        toleranceMs = maxOf(checkInterval.toLong(), PersistentScheduleDefaults.DEFAULT_TOLERANCE_MS),
-                        ownerUserId = activeSession?.userId ?: currentUid,
-                        sessionEpoch = activeSession?.sessionEpoch ?: AccountSessionCoordinator.currentSessionEpoch()
-                    )
-                    if (schedule.lastError != null) {
-                        if (PersistentLaunchPolicy.isFrontLaunchDisabled(schedule.lastError)) {
-                            record(TAG, "已禁止系统调度前台拉起目标应用，轮询任务降级为仅进程存活时等待")
-                        }
-                        UnifiedScheduler.scheduleLongDelay(delayMillis, "轮询任务") {
-                            ApplicationHookEntry.onPollAlarm()
-                        }
-                    } else {
+                    val schedule =
+                        UnifiedScheduler.schedulePersistentTrigger(
+                            context = context,
+                            name = "轮询任务",
+                            kind = PersistentScheduleKind.GLOBAL_POLL,
+                            triggerAtMs = triggerAt,
+                            dedupeKey = "alarm_poll",
+                            precisionPolicy = preservedPoll?.effectivePrecisionPolicy()
+                                ?: if (targetTime > 0) PersistentSchedulePrecisionPolicy.USER_EXACT
+                                else PersistentSchedulePrecisionPolicy.FLEXIBLE_POLL,
+                            payloadJson = "{}",
+                            toleranceMs = preservedPoll?.let { (it.deadlineAtMs() - it.triggerAtMs).coerceAtLeast(0L) }
+                                ?: maxOf(checkInterval.toLong(), PersistentScheduleDefaults.DEFAULT_TOLERANCE_MS),
+                            ownerUserId = activeSession?.userId ?: currentUid,
+                            sessionEpoch = activeSession?.sessionEpoch ?: AccountSessionCoordinator.currentSessionEpoch(),
+                        )
+                    if (schedule.state == PersistentScheduleState.SCHEDULED) {
+                        nextExecutionTime = schedule.triggerAtMs
+                        mainTaskNextScheduleUpdatedAtMs = System.currentTimeMillis()
                         UnifiedScheduler.cancelNamedTask("轮询任务")
+                    } else {
+                        val previous = PersistentScheduleRegistry.list().filter {
+                            it.kind == PersistentScheduleKind.GLOBAL_POLL &&
+                                it.state == PersistentScheduleState.SCHEDULED &&
+                                it.ownerUserId == activeSession?.userId && it.sessionEpoch == activeSession?.sessionEpoch
+                        }.minByOrNull { it.triggerAtMs }
+                        nextExecutionTime = previous?.triggerAtMs ?: 0L
+                        if (previous == null) Notify.updatePersistentSchedule(schedule)
+                        record(TAG, "下次执行计划注册失败，保留仍有效的旧计划: ${schedule.lastError}")
                     }
                 } else {
-                    UnifiedScheduler.scheduleLongDelay(delayMillis, "轮询任务") {
-                        ApplicationHookEntry.onPollAlarm()
-                    }
+                    record(TAG, "缺少应用 Context，未发布新的执行计划")
                 }
             } catch (e: Exception) {
                 Log.printStackTrace(TAG, "scheduleNextExecution failed", e)
@@ -976,8 +1162,16 @@ class ApplicationHook {
 
         // --- 初始化核心逻辑 ---
         @Synchronized
-        private fun initHandler(reason: String): Boolean {
+        private fun initHandler(reason: String, tasksStopped: Boolean = false, onComplete: ((Boolean) -> Unit)? = null): Boolean {
+            if (sessionShutdownPending) {
+                pendingInit = true
+                pendingInitReason = reason
+                onComplete?.invoke(false)
+                return false
+            }
             var sessionApplied = false
+            var completed = false
+            var completionDeferred = false
             try {
                 // 启动阶段可能出现 Service.onCreate 与 Launcher.onResume 并发触发 initHandler 的竞态：
                 // - onResume 线程看到 init=false -> 进入 initHandler 等锁
@@ -989,6 +1183,7 @@ class ApplicationHook {
                     pendingInit = false
                     pendingInitReason = null
                     record(TAG, "✅ 已初始化完成，忽略重复初始化触发: $reason")
+                    completed = true
                     return true
                 }
 
@@ -998,73 +1193,138 @@ class ApplicationHook {
                     record(TAG, "⏳ Service 未就绪，延后初始化: $reason")
                     return false
                 }
+                if (!RuntimeIdentityGuard.isTrustedForExecution()) {
+                    record(TAG, "instance_rejected: ${RuntimeIdentityGuard.lastReasonCode() ?: "identity_not_verified"}")
+                    Log.w(TAG, "instance_rejected: ${RuntimeIdentityGuard.lastReasonCode() ?: "identity_not_verified"}")
+                    return false
+                }
 
                 val activeClassLoader = classLoader ?: return false
                 val userId = HookUtil.getUserId(activeClassLoader)
                 if (userId == null) {
+                    Log.w(TAG, "account_unavailable: phase=initialization trigger=$reason")
+                    onHostAccountUnavailable(reason)
                     show("用户未登录")
                     return false
                 }
 
+                // 切换会话会先推进 epoch，必须在此之前捕获旧计划及其配置。
+                if (!tasksStopped) {
+                    if (init && shouldCaptureReloadState(reason)) captureReloadResumeDecision(reason)
+                    else reloadResumeDecision = null
+                }
                 val allowPersistedSessionReuse =
                     !init &&
                         (reason == "onResume" || reason == "service_onCreate")
-                AccountSessionCoordinator.beginSessionSwitch(
-                    reason,
-                    userId,
-                    allowPersistedReuse = allowPersistedSessionReuse
-                )
-                appContext?.let { context ->
-                    PersistentScheduleRegistry.activateSession(
-                        context = context,
-                        ownerUserId = userId,
-                        sessionEpoch = AccountSessionCoordinator.currentSessionEpoch()
-                    )
+                if (!tasksStopped) {
+                    AccountSessionCoordinator.beginSessionSwitch(reason, userId, allowPersistedReuse = allowPersistedSessionReuse)
+                    sessionShutdownPending = true
+                    val stopped = io.github.aoguai.sesameag.task.ModelTask.stopAllTaskAndNotify(mainTask) {
+                        ApplicationHookConstants.submitEntry("session_tasks_stopped") {
+                            sessionShutdownPending = false
+                            val unchanged = HookUtil.getUserId(activeClassLoader) == userId
+                            if (!unchanged) onComplete?.invoke(false)
+                            initHandler(
+                                if (unchanged) reason else "user_switch",
+                                tasksStopped = unchanged,
+                                onComplete = onComplete.takeIf { unchanged },
+                            )
+                        }
+                    }
+                    if (!stopped) {
+                        completionDeferred = true
+                        pendingInit = true
+                        pendingInitReason = reason
+                        updateRunningStatus("等待旧账号任务退出")
+                        return false
+                    }
+                    sessionShutdownPending = false
+                }
+                val admission = when (val result = AccountSlotRegistry.admitRuntimeUser(userId)) {
+                    is AccountSlotAdmission.Denied -> {
+                        record(TAG, "execution_gate_denied: ${result.reasonCode} process_role=main")
+                        Log.w(TAG, "execution_gate_denied: ${result.reasonCode} process_role=main account=${AccountSlotRegistry.shortHash(userId)}")
+                        destroyHandlerInternal("account_slot_${result.reasonCode}", invalidateSession = true)
+                        return false
+                    }
+
+                    is AccountSlotAdmission.Allowed -> result
                 }
                 if (init) {
-                    if (shouldCaptureReloadState(reason)) {
-                        captureReloadResumeDecision(reason)
-                    } else {
-                        reloadResumeDecision = null
-                    }
                     destroyHandlerInternal("reinit_$reason", invalidateSession = false)
                 } else {
-                    reloadResumeDecision = null
                     EnergyWaitingManager.resetForSessionSwitch(reason)
                 }
 
                 // 初始化广播（RPC 调试 / 手动任务等功能依赖）
                 try {
                     registerBroadcastReceiver(appContext!!)
-                } catch (_: Throwable) { /* ignore */ }
+                } catch (_: Throwable) {
+                    // ignore
+                }
                 try {
                     registerAppVisibilityCallbacks(appContext!!)
-                } catch (_: Throwable) { /* ignore */ }
+                } catch (_: Throwable) {
+                    // ignore
+                }
 
-                ensureScheduler()
+                // Model metadata is required by Config.load(), but session work waits for a stable slot.
                 Model.initAllModel()
 
-                pendingInit = false
-                pendingInitReason = null
                 UserMap.setCurrentUserId(userId)
                 load(userId)
-                // 冷启动期目标应用社交库(AliAccountDaoOp)可能尚未加载完，过早 getAllFriends() 会拿到
-                // “非空但不完整”的好友快照，被 mergeFromUserMap(allowPruneMissing=true) 误剪为 REMOVED 并持久化。
-                // 这里先同步加载本地已持久化的好友身份(上次完整快照)，供本会话首轮任务使用；
-                // 真正从目标应用侧获取实时快照后移到社交库就绪概率更高的时机再做。手动刷新(force=true)不走此路径，仍立即执行。
+                // 首轮先使用已保存的好友资料；延迟采集实时缓存，任何缓存缺失都不用于判定删除。
                 runCatching { UserMap.load(userId) }.onFailure {
                     printStackTrace(TAG, "初始化加载本地好友快照失败", it)
                 }
-                scheduleDeferredFriendCenterSync(userId, reason)
                 record(TAG, "Sesame-AG 开始初始化...")
 
                 Config.load(userId)
                 LocaleSettingsApplier.apply(appContext)
-                Logback.reloadFileLogging()
+                Logback.reloadFileLogging(enableCaptureAppender = true)
+                RpcTrafficCapture.refreshCaptureState()
                 val activeUserSnapshot = AccountSessionCoordinator.ensureActiveUserSnapshot(userId, activeClassLoader)
+                if (admission.requiresConfirmation) {
+                    when (val confirmation = AccountSlotRegistry.confirmRuntimeUser(userId)) {
+                        AccountSlotRuntimeConfirmation.Confirmed -> Unit
+                        AccountSlotRuntimeConfirmation.PendingPersistence,
+                        AccountSlotRuntimeConfirmation.Expired,
+                        AccountSlotRuntimeConfirmation.RegistryUnavailable -> {
+                            val reasonCode = when (confirmation) {
+                                AccountSlotRuntimeConfirmation.PendingPersistence ->
+                                    "account_slot_provision_unconfirmed"
+                                AccountSlotRuntimeConfirmation.Expired -> "account_slot_provision_expired"
+                                AccountSlotRuntimeConfirmation.RegistryUnavailable ->
+                                    "account_slot_registry_unavailable"
+                                AccountSlotRuntimeConfirmation.Confirmed -> error("unreachable")
+                            }
+                            record(TAG, "execution_gate_denied: $reasonCode process_role=main")
+                            Log.w(TAG, "execution_gate_denied: $reasonCode process_role=main account=${AccountSlotRegistry.shortHash(userId)}")
+                            destroyHandlerInternal("account_slot_$reasonCode", invalidateSession = true)
+                            return false
+                        }
+                    }
+                }
+                val executionCheck = AccountSlotRegistry.checkExecutableUser(userId)
+                if (executionCheck !is AccountSlotExecutionCheck.Allowed) {
+                    val reasonCode = when (executionCheck) {
+                        is AccountSlotExecutionCheck.Inactive -> "account_slot_inactive"
+                        AccountSlotExecutionCheck.InvalidUserId -> "account_slot_invalid_user_id"
+                        AccountSlotExecutionCheck.RegistryUnavailable -> "account_slot_registry_unavailable"
+                        is AccountSlotExecutionCheck.Allowed -> error("unreachable")
+                    }
+                    record(TAG, "execution_gate_rejected_before_apply: $reasonCode process_role=main")
+                    Log.w(TAG, "execution_gate_rejected_before_apply: $reasonCode process_role=main account=${AccountSlotRegistry.shortHash(userId)}")
+                    destroyHandlerInternal("account_slot_recheck", invalidateSession = true)
+                    return false
+                }
+
+                ensureScheduler()
                 val legalAccepted = Config.isLoaded() && Config.isLegalAcceptedForCurrentVersion()
                 val workflowAllowed =
-                    WorkflowRootGuard.hasGrantedRoot() &&
+                    RuntimeIdentityGuard.isTrustedForExecution() &&
+                        WorkflowRootGuard.hasGrantedRoot() &&
+                        WorkflowRootGuard.isExecutionAllowed() &&
                         legalAccepted &&
                         !ApplicationHookConstants.isOffline()
                 AccountSessionCoordinator.applySession(
@@ -1073,9 +1333,11 @@ class ApplicationHook {
                     activeUserSnapshot = activeUserSnapshot,
                     legalAccepted = legalAccepted,
                     workflowAllowed = workflowAllowed,
-                    reason = reason
+                    reason = reason,
                 )
                 sessionApplied = true
+                pendingInit = false
+                pendingInitReason = null
 
                 if (!Config.isLoaded()) return false
                 if (!ensureRootAccessForWorkflow(reason)) {
@@ -1087,20 +1349,26 @@ class ApplicationHook {
                 if (!ensureRpcVersionSupported()) {
                     return false
                 }
+                scheduleDeferredFriendCenterSync(userId, reason)
 
                 // Phase 7：DataStore watcher 生命周期治理（用户切换/重载后重启 watcher，避免丢失跨进程同步能力）
                 try {
                     init(Files.CONFIG_DIR)
-                } catch (_: Throwable) { /* ignore */ }
+                } catch (_: Throwable) {
+                    // ignore
+                }
 
                 // 仅在用户开启“抓包调试模式”时启动调试 HTTP 服务（release 也可用）
                 try {
                     if (debugMode.value == true) {
                         startIfNeeded(8080, "ET3vB^#td87sQqKaY*eMUJXP", processName, General.PACKAGE_NAME)
                     } else {
-                        io.github.aoguai.sesameag.hook.server.ModuleHttpServerManager.stop()
+                        io.github.aoguai.sesameag.hook.server.ModuleHttpServerManager
+                            .stop()
                     }
-                } catch (_: Throwable) { /* ignore */ }
+                } catch (_: Throwable) {
+                    // ignore
+                }
 
                 Notify.startRunning(service!!)
                 setWakenAtTimeAlarm()
@@ -1126,9 +1394,10 @@ class ApplicationHook {
                 pendingInit = false
                 pendingInitReason = null
                 EnergyWaitingManager.restoreForCurrentSession("init_ready")
-                handlePersistentLaunchAfterInit(appContext!!)
+                val deferGenericStartupTrigger = handlePersistentLaunchAfterInit(appContext!!)
                 ModuleStatusReporter.requestUpdate(reason = "ready")
-                ApplicationHookEntry.onInitCompleted(reason)
+                ApplicationHookEntry.onInitCompleted(reason, deferGenericStartupTrigger)
+                completed = true
                 return true
             } catch (th: Throwable) {
                 if (sessionApplied) {
@@ -1139,20 +1408,27 @@ class ApplicationHook {
                 }
                 printStackTrace(TAG, "startHandler", th)
                 return false
+            } finally {
+                if (!completionDeferred) onComplete?.invoke(completed)
             }
         }
 
-        private fun handlePersistentLaunchAfterInit(context: Context) {
+        private fun handlePersistentLaunchAfterInit(context: Context): Boolean {
             val launchScheduleId = pendingPersistentLaunchScheduleId
             if (launchScheduleId.isNullOrBlank()) {
                 UnifiedScheduler.reconcilePersistentSchedules(
                     context,
-                    mode = PersistentReconcileMode.FIRE_ALARM_DUE
+                    mode = PersistentReconcileMode.FIRE_ALARM_DUE,
                 )
-                return
+                return PersistentScheduleRegistry.hasActiveModuleChild(
+                    AccountSessionCoordinator.currentUserId(),
+                    AccountSessionCoordinator.currentSessionEpoch(),
+                )
             }
             record(TAG, "初始化完成，处理持久调度唤醒任务[$launchScheduleId]")
-            val schedule = PersistentScheduleRegistry.get(launchScheduleId)
+            val confirmed = ScheduledTaskRouter.confirmTargetLaunch(launchScheduleId, pendingPersistentLaunchConfirmationAt)
+            pendingPersistentLaunchConfirmationAt = 0L
+            val schedule = if (confirmed) PersistentScheduleRegistry.get(launchScheduleId) else null
             if (schedule != null) {
                 if (ScheduledTaskRouter.fire(context, schedule, "init_ready")) {
                     pendingPersistentLaunchScheduleId = null
@@ -1161,6 +1437,10 @@ class ApplicationHook {
                 record(TAG, "初始化完成但持久调度任务不存在[$launchScheduleId]")
                 pendingPersistentLaunchScheduleId = null
             }
+            return PersistentScheduleRegistry.hasActiveModuleChild(
+                AccountSessionCoordinator.currentUserId(),
+                AccountSessionCoordinator.currentSessionEpoch(),
+            )
         }
 
         private fun checkBatteryPermission() {
@@ -1177,10 +1457,16 @@ class ApplicationHook {
 
         @Synchronized
         fun destroyHandler() {
-            destroyHandlerInternal("destroy_handler", invalidateSession = true)
+            // 允许任意 Hook 线程请求销毁，但绝不让生命周期/主线程同步执行整套清理。
+            ApplicationHookConstants.submitEntry("destroy_handler") {
+                destroyHandlerInternal("destroy_handler", invalidateSession = true)
+            }
         }
 
-        private fun destroyHandlerInternal(reason: String, invalidateSession: Boolean) {
+        private fun destroyHandlerInternal(
+            reason: String,
+            invalidateSession: Boolean,
+        ) {
             try {
                 if (invalidateSession) {
                     AccountSessionCoordinator.clearRuntimeSession(reason)
@@ -1190,6 +1476,8 @@ class ApplicationHook {
                 pendingInitReason = null
                 rootCheckInProgress = false
                 pendingPersistentLaunchScheduleId = null
+                pendingPersistentLaunchConfirmationAt = 0L
+                pendingPersistentLaunchBatch = false
                 ApplicationHookConstants.clearPendingTriggers(reason)
                 if (invalidateSession) {
                     PersistentScheduleRegistry.clearAll(appContext)
@@ -1198,12 +1486,14 @@ class ApplicationHook {
                 lastExecTime = 0
                 EnergyWaitingManager.resetForSessionSwitch(reason)
                 try {
-                    io.github.aoguai.sesameag.util.DataStore.shutdown()
+                    io.github.aoguai.sesameag.util.DataStore
+                        .shutdown()
                 } catch (_: Throwable) {
                     // ignore
                 }
                 try {
-                    io.github.aoguai.sesameag.util.UserDataStoreManager.shutdownAll()
+                    io.github.aoguai.sesameag.util.UserDataStoreManager
+                        .shutdownAll()
                 } catch (_: Throwable) {
                     // ignore
                 }
@@ -1216,6 +1506,7 @@ class ApplicationHook {
                     stopRunning()
                     clearIntervalLimit()
                     Config.unload()
+                    RpcTrafficCapture.refreshCaptureState()
                     UserMap.setCurrentUserId(null)
                     UserMap.unload()
                 }
@@ -1241,7 +1532,7 @@ class ApplicationHook {
         }
 
         private fun ensureRootAccessForWorkflow(reason: String): Boolean {
-            if (WorkflowRootGuard.hasGrantedRoot()) {
+            if (WorkflowRootGuard.hasGrantedRoot() && WorkflowRootGuard.isExecutionAllowed()) {
                 pendingInit = false
                 pendingInitReason = null
                 AccountSessionCoordinator.refreshWorkflowState(appContext, "root_granted_cached")
@@ -1258,20 +1549,33 @@ class ApplicationHook {
             record(TAG, "⏳ 正在检查执行权限，暂不启动工作流: $reason")
             execute {
                 try {
-                    val granted = WorkflowRootGuard.hasRoot(forceRefresh = true, reason = reason)
+                    val context = appContext ?: return@execute
+                    val executorStatus = CommandUtil.awaitServiceStatus(context)
+                    if (executorStatus is CommandUtil.ServiceStatus.Loading ||
+                        executorStatus is CommandUtil.ServiceStatus.Error
+                    ) {
+                        record(TAG, "⏳ 执行权限服务尚未就绪，保留待初始化状态: $reason")
+                        return@execute
+                    }
+                    val granted = WorkflowRootGuard.hasRoot(forceRefresh = true, reason = reason) &&
+                        executorStatus is CommandUtil.ServiceStatus.Active &&
+                        WorkflowRootGuard.isExecutionAllowed()
                     if (!granted) {
-                        updateRunningStatus("未检测到可用执行权限，已禁止工作流")
+                        Log.w(TAG, "execution_prerequisites_missing: trigger=$reason executor=${executorStatus.javaClass.simpleName} " +
+                            "account=${currentUid?.let(AccountSlotRegistry::shortHash) ?: "unknown"}")
+                        updateRunningStatus("必需权限或使用协议未就绪，已禁止工作流")
                         ApplicationHookConstants.clearPendingTriggers("root_denied")
                         AccountSessionCoordinator.refreshWorkflowState(appContext, "root_denied")
                         return@execute
                     }
 
-                    val retryReason = pendingInitReason ?: reason
-                    rootCheckInProgress = false
-                    if (service != null && !init) {
-                        record(TAG, "✅ 执行权限检查通过，继续初始化: $retryReason")
-                        if (initHandler(retryReason)) {
-                            init = true
+                    ApplicationHookConstants.submitEntry("execution_permission_ready") {
+                        val retryReason = pendingInitReason ?: reason
+                        if (service != null && (!init || pendingInit)) {
+                            record(TAG, "✅ 执行权限检查通过，继续初始化: $retryReason")
+                            if (initHandler(retryReason)) {
+                                init = true
+                            }
                         }
                     }
                 } catch (th: Throwable) {
@@ -1289,33 +1593,55 @@ class ApplicationHook {
                 val userId = HookUtil.getUserId(activeClassLoader) ?: return false
                 Config.load(userId)
                 LocaleSettingsApplier.apply(appContext)
+                RpcTrafficCapture.refreshCaptureState()
             }
-            if (Config.isLegalAcceptedForCurrentVersion()) {
+            val legalAccepted = Config.isLegalAcceptedForCurrentVersion()
+            if (legalAccepted && WorkflowRootGuard.isExecutionAllowed()) {
                 AccountSessionCoordinator.refreshWorkflowState(appContext, "legal_accepted", legalAccepted = true)
                 return true
             }
 
             pendingInit = false
             pendingInitReason = null
-            val message = "未勾选已阅读 LICENSE 与 LEGAL 说明，已禁止工作流"
+            val message = "必需权限或使用协议未就绪，已禁止工作流"
             record(TAG, "⛔ $message")
+            Log.w(TAG, "execution_prerequisites_missing: legalAccepted=$legalAccepted account=${currentUid?.let(AccountSlotRegistry::shortHash) ?: "unknown"}")
             updateRunningStatus(message)
-            ApplicationHookConstants.clearPendingTriggers("legal_unaccepted")
-            AccountSessionCoordinator.refreshWorkflowState(appContext, "legal_unaccepted", legalAccepted = false)
+            ApplicationHookConstants.clearPendingTriggers("execution_prerequisites_missing")
+            AccountSessionCoordinator.refreshWorkflowState(appContext, "execution_prerequisites_missing", legalAccepted = legalAccepted)
             return false
         }
 
-        private fun stopHandler() {
-            runBlocking {
-                val mainTaskStopped = mainTask?.stopTaskAndWait() ?: true
-                val modelTasksStopped = stopAllTaskAndWait()
-                if (!mainTaskStopped || !modelTasksStopped) {
-                    record(
-                        TAG,
-                        "等待任务停止超时: mainTaskStopped=$mainTaskStopped modelTasksStopped=$modelTasksStopped"
-                    )
-                }
+        internal fun onHostAccountUnavailable(reason: String) {
+            if (init || AccountSessionCoordinator.currentSession() != null || AccountSessionCoordinator.isSwitching()) {
+                destroyHandlerInternal(reason, invalidateSession = true)
             }
+            ApplicationHookConstants.setOffline(true, "login_timeout", reason)
+        }
+
+        internal fun reconcileHostSession(reason: String): Boolean {
+            val loader = classLoader ?: return false
+            val userId = HookUtil.getUserId(loader)
+            if (userId.isNullOrBlank()) {
+                onHostAccountUnavailable(reason)
+                return false
+            }
+            val session = AccountSessionCoordinator.currentSession()
+            if (session == null || session.userId != userId ||
+                !AccountSessionCoordinator.isCurrentSession(userId, session.sessionEpoch)
+            ) {
+                initHandler("user_switch")
+                return false
+            }
+            return true
+        }
+
+        private fun stopHandler() {
+            // 销毁只能请求取消，不能在宿主生命周期或入口线程同步等待协程结束。
+            runCatching { mainTask?.stopTask() }
+                .onFailure { Log.printStackTrace(TAG, "请求停止主任务失败", it) }
+            runCatching { stopAllTask() }
+                .onFailure { Log.printStackTrace(TAG, "请求停止模型任务失败", it) }
         }
 
         // --- 杂项方法 ---
@@ -1346,36 +1672,30 @@ class ApplicationHook {
             }
         }
 
-        fun sendBroadcast(action: String?) {
-            if (appContext != null) appContext!!.sendBroadcast(Intent(action))
-        }
-
-        fun sendBroadcastShell(api: String?, message: String?) {
-            if (appContext == null) return
-            val intent = Intent("io.github.aoguai.sesameag.SHELL")
-            intent.putExtra(api, message)
-            appContext!!.sendBroadcast(intent, null)
-        }
-
-        @JvmStatic
-        fun reLoginByBroadcast() {
-            sendBroadcast(ApplicationHookConstants.BroadcastActions.RE_LOGIN)
-        }
-
-        fun restartByBroadcast() {
-            sendBroadcast(ApplicationHookConstants.BroadcastActions.RESTART)
-        }
-
         fun reOpenApp() {
             ensureScheduler()
             UnifiedScheduler.scheduleLongDelay(20000L, "重新登录") {
+                if (!WorkflowRootGuard.isExecutionAllowed()) {
+                    record(TAG, "必需权限或使用协议未就绪，已取消重新登录")
+                    return@scheduleLongDelay
+                }
+                if (ApplicationResumeCoordinator.isHostAppForeground()) {
+                    record(TAG, "目标应用已在前台，等待当前验证完成，跳过重新登录拉起")
+                    return@scheduleLongDelay
+                }
+                val ownerUserId = AccountSessionCoordinator.currentUserId() ?: currentUid
+                if (!ScheduledTaskRouter.allowRuntimeForegroundLaunch(ownerUserId, "reopen_app")) {
+                    record(TAG, "已跳过重新拉起目标应用：前台拉起开关关闭或处于频控")
+                    return@scheduleLongDelay
+                }
                 try {
                     ApplicationResumeCoordinator.recordReOpenAppLaunch()
                     val intent = Intent(Intent.ACTION_VIEW)
                     intent.setClassName(General.PACKAGE_NAME, General.CURRENT_USING_ACTIVITY)
                     intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    if (appContext != null) appContext!!.startActivity(intent)
+                    appContext?.startActivity(intent)
                 } catch (e: Exception) {
+                    ScheduledTaskRouter.recordRuntimeForegroundLaunchFailure(ownerUserId, "reopen_app", e)
                     error(TAG, "重启Activity失败: " + e.message)
                 }
             }
@@ -1403,17 +1723,18 @@ class ApplicationHook {
             val delayToMidnight = calendar.getTimeInMillis() - System.currentTimeMillis()
             if (delayToMidnight > 0) {
                 val activeSession = AccountSessionCoordinator.currentSession()
-                val midnightSchedule = UnifiedScheduler.schedulePersistentTrigger(
-                    context = context,
-                    name = "每日0点任务",
-                    kind = PersistentScheduleKind.GLOBAL_WAKEUP,
-                    triggerAtMs = calendar.timeInMillis,
-                    dedupeKey = "wakeup_midnight",
-                    payloadJson = """{"waken_time":"0000","wake_type":"midnight"}""",
-                    toleranceMs = PersistentScheduleDefaults.DEFAULT_TOLERANCE_MS,
-                    ownerUserId = activeSession?.userId ?: currentUid,
-                    sessionEpoch = activeSession?.sessionEpoch ?: AccountSessionCoordinator.currentSessionEpoch()
-                )
+                val midnightSchedule =
+                    UnifiedScheduler.schedulePersistentTrigger(
+                        context = context,
+                        name = "每日0点任务",
+                        kind = PersistentScheduleKind.GLOBAL_WAKEUP,
+                        triggerAtMs = calendar.timeInMillis,
+                        dedupeKey = "wakeup_midnight",
+                        payloadJson = """{"waken_time":"0000","wake_type":"midnight"}""",
+                        toleranceMs = PersistentScheduleDefaults.DEFAULT_TOLERANCE_MS,
+                        ownerUserId = activeSession?.userId ?: currentUid,
+                        sessionEpoch = activeSession?.sessionEpoch ?: AccountSessionCoordinator.currentSessionEpoch(),
+                    )
                 if (midnightSchedule.lastError != null) {
                     if (PersistentLaunchPolicy.isFrontLaunchDisabled(midnightSchedule.lastError)) {
                         record(TAG, "已禁止系统调度前台拉起目标应用，每日0点任务降级为仅进程存活时等待")
@@ -1437,24 +1758,27 @@ class ApplicationHook {
             if (delay <= 0) return
 
             val targetCalendar = Calendar.getInstance().apply { timeInMillis = nextWakeAt }
-            val secondOfDay = targetCalendar.get(Calendar.HOUR_OF_DAY) * 3600 +
-                targetCalendar.get(Calendar.MINUTE) * 60 +
-                targetCalendar.get(Calendar.SECOND)
-            val timeToken = TimeTriggerParser.formatSecondOfDay(
-                secondOfDay,
-                useSeconds = targetCalendar.get(Calendar.SECOND) != 0
-            )
-            val customWakeSchedule = UnifiedScheduler.schedulePersistentTrigger(
-                context = context,
-                name = "自定义唤醒任务",
-                kind = PersistentScheduleKind.GLOBAL_WAKEUP,
-                triggerAtMs = nextWakeAt,
-                dedupeKey = "wakeup_custom",
-                payloadJson = """{"waken_time":"$timeToken","wake_type":"custom"}""",
-                toleranceMs = PersistentScheduleDefaults.DEFAULT_TOLERANCE_MS,
-                ownerUserId = AccountSessionCoordinator.currentUserId() ?: currentUid,
-                sessionEpoch = AccountSessionCoordinator.currentSessionEpoch()
-            )
+            val secondOfDay =
+                targetCalendar.get(Calendar.HOUR_OF_DAY) * 3600 +
+                    targetCalendar.get(Calendar.MINUTE) * 60 +
+                    targetCalendar.get(Calendar.SECOND)
+            val timeToken =
+                TimeTriggerParser.formatSecondOfDay(
+                    secondOfDay,
+                    useSeconds = targetCalendar.get(Calendar.SECOND) != 0,
+                )
+            val customWakeSchedule =
+                UnifiedScheduler.schedulePersistentTrigger(
+                    context = context,
+                    name = "自定义唤醒任务",
+                    kind = PersistentScheduleKind.GLOBAL_WAKEUP,
+                    triggerAtMs = nextWakeAt,
+                    dedupeKey = "wakeup_custom",
+                    payloadJson = """{"waken_time":"$timeToken","wake_type":"custom"}""",
+                    toleranceMs = PersistentScheduleDefaults.DEFAULT_TOLERANCE_MS,
+                    ownerUserId = AccountSessionCoordinator.currentUserId() ?: currentUid,
+                    sessionEpoch = AccountSessionCoordinator.currentSessionEpoch(),
+                )
             if (customWakeSchedule.lastError != null) {
                 if (PersistentLaunchPolicy.isFrontLaunchDisabled(customWakeSchedule.lastError)) {
                     record(TAG, "已禁止系统调度前台拉起目标应用，自定义唤醒任务降级为仅进程存活时等待[$timeToken]")
@@ -1469,14 +1793,14 @@ class ApplicationHook {
                     context,
                     "自定义唤醒任务",
                     "wakeup_custom",
-                    silent = true
+                    silent = true,
                 )
             }
             return
         }
 
         fun registerBroadcastReceiver(context: Context) {
-            if (mBroadcastReceiver != null) return  // 防止重复注册
+            if (mBroadcastReceiver != null) return // 防止重复注册
 
             try {
                 mBroadcastReceiver = AlipayBroadcastReceiver()
@@ -1501,7 +1825,7 @@ class ApplicationHook {
                         mBroadcastReceiver,
                         filter,
                         // 该接收器依赖模块进程发起的自定义广播，必须允许跨 App 投递。
-                        ContextCompat.RECEIVER_EXPORTED
+                        ContextCompat.RECEIVER_EXPORTED,
                     )
                 }
                 record(TAG, "BroadcastReceiver registered")
@@ -1556,44 +1880,46 @@ class ApplicationHook {
         @Volatile
         private var remotePreferences: SharedPreferences? = null
 
-        internal fun requireXposedInterface(): XposedInterface {
-            return frameworkInterface ?: throw IllegalStateException("XposedInterface 未初始化")
-        }
+        internal fun requireXposedInterface(): XposedInterface = frameworkInterface ?: throw IllegalStateException("XposedInterface 未初始化")
 
-        private fun getFrameworkRuntimeInfo(): FrameworkRuntimeInfo? {
-            return frameworkRuntimeInfo
-        }
+        private fun getFrameworkRuntimeInfo(): FrameworkRuntimeInfo? = frameworkRuntimeInfo
 
-        internal fun resolveCurrentFrameworkName(loader: ClassLoader? = classLoader): String {
-            return resolveCurrentFrameworkInfo(loader).displayName
-        }
+        internal fun resolveCurrentFrameworkInfo(): ModuleStatus.FrameworkInfo =
+            ModuleStatus.resolveFrameworkInfo(frameworkRuntimeInfo?.name)
 
-        internal fun resolveCurrentFrameworkInfo(loader: ClassLoader? = classLoader): ModuleStatus.FrameworkInfo {
-            return ModuleStatus.resolveFrameworkInfo(frameworkRuntimeInfo?.name, loader)
+        internal fun hasSupportedLibXposedRuntime(): Boolean {
+            val runtimeInfo = frameworkRuntimeInfo ?: return false
+            return ModuleStatus.isSupportedLsposedFramework(runtimeInfo.name, runtimeInfo.apiVersion ?: 0)
         }
 
         private fun updateFrameworkRuntimeInfo(xposedInterface: XposedInterface?) {
             frameworkInterface = xposedInterface
-            frameworkRuntimeInfo = xposedInterface?.let { framework ->
-                FrameworkRuntimeInfo(
-                    name = runCatching { framework.frameworkName }.getOrNull(),
-                    version = runCatching { framework.frameworkVersion }.getOrNull(),
-                    versionCode = runCatching { framework.frameworkVersionCode }.getOrNull(),
-                    apiVersion = runCatching { framework.apiVersion }.getOrNull(),
-                    properties = runCatching { framework.frameworkProperties }.getOrNull()
-                )
-            }
+            frameworkRuntimeInfo =
+                xposedInterface?.let { framework ->
+                    FrameworkRuntimeInfo(
+                        name = runCatching { framework.frameworkName }.getOrNull(),
+                        version = runCatching { framework.frameworkVersion }.getOrNull(),
+                        versionCode = runCatching { framework.frameworkVersionCode }.getOrNull(),
+                        apiVersion = runCatching { framework.apiVersion }.getOrNull(),
+                        properties = runCatching { framework.frameworkProperties }.getOrNull(),
+                    )
+                }
             ModuleStatusReporter.setBaseInfo(
                 framework = frameworkRuntimeInfo?.name,
-                packageName = null
+                packageName = null,
             )
         }
 
-        private fun loadClass(loader: ClassLoader, className: String): Class<*> {
-            return Class.forName(className, false, loader)
-        }
+        private fun loadClass(
+            loader: ClassLoader,
+            className: String,
+        ): Class<*> = Class.forName(className, false, loader)
 
-        private fun findMethod(targetClass: Class<*>, name: String, vararg parameterTypes: Class<*>): Method {
+        private fun findMethod(
+            targetClass: Class<*>,
+            name: String,
+            vararg parameterTypes: Class<*>,
+        ): Method {
             var current: Class<*>? = targetClass
             while (current != null) {
                 runCatching {
@@ -1608,14 +1934,16 @@ class ApplicationHook {
             }
         }
 
-        private fun logFramework(priority: Int, message: String, throwable: Throwable? = null) {
+        private fun logFrameworkWarning(
+            message: String,
+            throwable: Throwable? = null,
+        ) {
             val logger = frameworkInterface ?: return
             if (throwable != null) {
-                logger.log(priority, TAG, message, throwable)
+                logger.log(android.util.Log.WARN, TAG, message, throwable)
             } else {
-                logger.log(priority, TAG, message)
+                logger.log(android.util.Log.WARN, TAG, message)
             }
         }
     }
 }
-

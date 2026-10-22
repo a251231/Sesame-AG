@@ -17,6 +17,13 @@ object Log {
     private val errorCountMap = ConcurrentHashMap<String, AtomicInteger>()
     private val loggerMap: Map<LogChannel, Logger>
 
+    fun interface WarningErrorMirror {
+        fun write(priority: Int, message: String)
+    }
+
+    @Volatile
+    private var warningErrorMirror: WarningErrorMirror? = null
+
     private enum class Severity {
         DEBUG,
         INFO,
@@ -32,6 +39,15 @@ object Log {
     init {
         Logback.initLogcatOnly()
         loggerMap = LogCatalog.channels.associateWith { LoggerFactory.getLogger(it.loggerName) }
+    }
+
+    @JvmStatic
+    fun setWarningErrorMirror(mirror: WarningErrorMirror?) {
+        warningErrorMirror = mirror
+    }
+
+    private fun mirrorWarningOrError(priority: Int, message: String) {
+        runCatching { warningErrorMirror?.write(priority, message) }
     }
 
     @JvmStatic
@@ -118,6 +134,14 @@ object Log {
     private fun logRaw(channel: LogChannel, severity: Severity, msg: String) {
         Logback.refreshIfCrossDay()
 
+        // 稳定的 Android 日志出口独立于文件通道开关，供早期故障回填。
+        if (severity == Severity.WARN || severity == Severity.ERROR) {
+            android.util.Log.println(
+                if (severity == Severity.ERROR) android.util.Log.ERROR else android.util.Log.WARN,
+                "SesameLog",
+                "module=${BuildConfig.APPLICATION_ID} $msg"
+            )
+        }
         if (!shouldWrite(channel)) {
             return
         }
@@ -125,8 +149,14 @@ object Log {
         when (severity) {
             Severity.DEBUG -> logger.debug("{}", msg)
             Severity.INFO -> logger.info("{}", msg)
-            Severity.WARN -> logger.warn("{}", msg)
-            Severity.ERROR -> logger.error("{}", msg)
+            Severity.WARN -> {
+                logger.warn("{}", msg)
+                mirrorWarningOrError(android.util.Log.WARN, msg)
+            }
+            Severity.ERROR -> {
+                logger.error("{}", msg)
+                mirrorWarningOrError(android.util.Log.ERROR, msg)
+            }
         }
     }
 
@@ -214,8 +244,23 @@ object Log {
     }
 
     @JvmStatic
+    fun forestPatrol(msg: String) {
+        business(LogChannel.FOREST_PATROL, msg)
+    }
+
+    @JvmStatic
     fun orchard(msg: String) {
         business(LogChannel.ORCHARD, msg)
+    }
+
+    @JvmStatic
+    fun goldenBean(msg: String) {
+        business(LogChannel.GOLDEN_BEAN, msg)
+    }
+
+    @JvmStatic
+    fun goldenBean(tag: String, msg: String) {
+        goldenBean(formatTaggedMessage(tag, msg))
     }
 
     @JvmStatic
@@ -245,13 +290,13 @@ object Log {
     }
 
     @JvmStatic
-    fun mybank(msg: String) {
-        business(LogChannel.MYBANK, msg)
+    fun youthPrivilege(msg: String) {
+        business(LogChannel.YOUTH_PRIVILEGE, msg)
     }
 
     @JvmStatic
-    fun fishpond(msg: String) {
-        business(LogChannel.FISHPOND, msg)
+    fun mybank(msg: String) {
+        business(LogChannel.MYBANK, msg)
     }
 
     @JvmStatic
@@ -291,7 +336,9 @@ object Log {
 
     @JvmStatic
     fun capture(msg: String) {
-        write(LogChannel.CAPTURE, Severity.INFO, msg)
+        // capture.log is shared by processes; keep every legacy capture record on one physical line.
+        val singleLineMessage = msg.replace("\r", "\\r").replace("\n", "\\n")
+        write(LogChannel.CAPTURE, Severity.INFO, singleLineMessage)
     }
 
     @JvmStatic

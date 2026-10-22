@@ -97,7 +97,6 @@ object ApplicationHookConstants {
         ENTER,
         REFRESH,
         EXIT,
-        AUTO_EXIT
     }
 
     data class OfflineEvent(
@@ -106,7 +105,7 @@ object ApplicationHookConstants {
         val cooldownMs: Long,
         val untilMs: Long,
         val reason: String?,
-        val detail: String?
+        val detail: String?,
     )
 
     data class AuthLikeOfflineSnapshot(
@@ -115,7 +114,7 @@ object ApplicationHookConstants {
         val detail: String,
         val method: String,
         val code: String,
-        val message: String
+        val message: String,
     )
 
     private const val OFFLINE_EVENT_MAX = 64
@@ -135,11 +134,13 @@ object ApplicationHookConstants {
     }
 
     @JvmStatic
-    fun getOfflineEventsSnapshot(): List<OfflineEvent> {
-        return offlineEvents.toList()
-    }
+    fun getOfflineEventsSnapshot(): List<OfflineEvent> = offlineEvents.toList()
 
-    private fun extractOfflineDetailValue(detail: String, key: String, vararg nextKeys: String): String {
+    private fun extractOfflineDetailValue(
+        detail: String,
+        key: String,
+        vararg nextKeys: String,
+    ): String {
         val marker = "$key="
         val start = detail.indexOf(marker)
         if (start < 0) {
@@ -161,11 +162,12 @@ object ApplicationHookConstants {
         if (explicitMethod.isNotBlank()) {
             return explicitMethod
         }
-        val firstMarker = sequenceOf(" code=", " msg=", " reason=")
-            .map { detail.indexOf(it) }
-            .filter { it >= 0 }
-            .minOrNull()
-            ?: -1
+        val firstMarker =
+            sequenceOf(" code=", " msg=", " reason=")
+                .map { detail.indexOf(it) }
+                .filter { it >= 0 }
+                .minOrNull()
+                ?: -1
         if (firstMarker <= 0) {
             return ""
         }
@@ -176,11 +178,12 @@ object ApplicationHookConstants {
     @JvmStatic
     fun getLatestAuthLikeOfflineSnapshot(): AuthLikeOfflineSnapshot? {
         val active = offline && offlineReason == "auth_like"
-        val detail = when {
-            active -> offlineReasonDetail
-            lastOfflineEnterReason == "auth_like" -> lastOfflineEnterReasonDetail
-            else -> null
-        }?.trim().orEmpty()
+        val detail =
+            when {
+                active -> offlineReasonDetail
+                lastOfflineEnterReason == "auth_like" -> lastOfflineEnterReasonDetail
+                else -> null
+            }?.trim().orEmpty()
         if (detail.isBlank()) {
             return null
         }
@@ -190,12 +193,16 @@ object ApplicationHookConstants {
             detail = detail,
             method = extractOfflineMethod(detail),
             code = extractOfflineDetailValue(detail, "code", "msg", "reason"),
-            message = extractOfflineDetailValue(detail, "msg", "reason")
+            message = extractOfflineDetailValue(detail, "msg", "reason"),
         )
     }
 
     @JvmStatic
-    fun enterOffline(cooldownMs: Long, reason: String? = null, detail: String? = null) {
+    fun enterOffline(
+        cooldownMs: Long,
+        reason: String? = null,
+        detail: String? = null,
+    ) {
         val wasOffline = offline
         val now = nowProvider()
 
@@ -214,7 +221,7 @@ object ApplicationHookConstants {
 
         record(
             TAG,
-            "enterOffline: type=${if (wasOffline) OfflineEventType.REFRESH else OfflineEventType.ENTER} cooldownMs=$cooldownMs untilMs=$offlineUntilMs reason=${reason ?: "null"} detail=${detail ?: "null"}"
+            "enterOffline: type=${if (wasOffline) OfflineEventType.REFRESH else OfflineEventType.ENTER} cooldownMs=$cooldownMs untilMs=$offlineUntilMs reason=${reason ?: "null"} detail=${detail ?: "null"}",
         )
 
         addOfflineEvent(
@@ -224,8 +231,8 @@ object ApplicationHookConstants {
                 cooldownMs = cooldownMs,
                 untilMs = offlineUntilMs,
                 reason = reason,
-                detail = detail
-            )
+                detail = detail,
+            ),
         )
 
         if (!wasOffline) {
@@ -237,15 +244,17 @@ object ApplicationHookConstants {
             stopAllTask()
             // 离线/风控发生时实时通知用户（含滑块验证 auth_like），补齐“风控无感知”缺口。
             if (BaseModel.errNotify.value == true) {
-                val title = when (reason) {
-                    "auth_like" -> "检测到风控/验证，已暂停"
-                    "rpc_error_threshold" -> "RPC 连续失败，已暂停"
-                    else -> "模块已进入离线，已暂停"
-                }
+                val title =
+                    when (reason) {
+                        "auth_like" -> "检测到风控/验证，已暂停"
+                        "rpc_error_threshold" -> "RPC 连续失败，已暂停"
+                        "network_error_threshold" -> "网络异常次数超过阈值，已暂停"
+                        else -> "模块已进入离线，已暂停"
+                    }
                 runCatching {
                     io.github.aoguai.sesameag.util.Notify.sendAlert(
                         title,
-                        detail?.takeIf { it.isNotBlank() } ?: "请打开支付宝完成验证或查看错误日志"
+                        detail?.takeIf { it.isNotBlank() } ?: "请打开支付宝完成验证或查看错误日志",
                     )
                 }
             }
@@ -253,7 +262,7 @@ object ApplicationHookConstants {
 
         AccountSessionCoordinator.refreshWorkflowState(
             ApplicationHook.appContext,
-            if (wasOffline) "offline_refresh" else "offline_enter"
+            if (wasOffline) "offline_refresh" else "offline_enter",
         )
         ModuleStatusReporter.requestUpdate(if (wasOffline) "offline_refresh" else "offline_enter")
     }
@@ -267,7 +276,7 @@ object ApplicationHookConstants {
 
         return maxOf(
             BaseModel.checkInterval.value?.toLong() ?: 180000L,
-            180000L
+            180000L,
         )
     }
 
@@ -277,7 +286,11 @@ object ApplicationHookConstants {
     }
 
     @JvmStatic
-    fun setOffline(value: Boolean, reason: String?, detail: String?) {
+    fun setOffline(
+        value: Boolean,
+        reason: String?,
+        detail: String?,
+    ) {
         if (value) {
             enterOffline(0L, reason, detail)
         } else {
@@ -287,10 +300,6 @@ object ApplicationHookConstants {
 
     @JvmStatic
     fun exitOffline() {
-        exitOfflineInternal(OfflineEventType.EXIT)
-    }
-
-    private fun exitOfflineInternal(type: OfflineEventType) {
         if (!offline) return
 
         val now = nowProvider()
@@ -309,58 +318,33 @@ object ApplicationHookConstants {
 
         addOfflineEvent(
             OfflineEvent(
-                type = type,
+                type = OfflineEventType.EXIT,
                 atMs = now,
                 cooldownMs = 0L,
                 untilMs = 0L,
                 reason = enterReason,
-                detail = enterDetail
-            )
+                detail = enterDetail,
+            ),
         )
 
-        record(TAG, "exitOffline: type=$type durationMs=$durationMs reason=${enterReason ?: "null"} detail=${enterDetail ?: "null"}")
+        record(TAG, "exitOffline: type=EXIT durationMs=$durationMs reason=${enterReason ?: "null"} detail=${enterDetail ?: "null"}")
 
         AccountSessionCoordinator.refreshWorkflowState(
             ApplicationHook.appContext,
-            when (type) {
-                OfflineEventType.EXIT -> "offline_exit"
-                OfflineEventType.AUTO_EXIT -> "offline_auto_exit"
-                else -> "offline_exit"
-            }
+            "offline_exit",
         )
-        ModuleStatusReporter.requestUpdate(
-            when (type) {
-                OfflineEventType.EXIT -> "offline_exit"
-                OfflineEventType.AUTO_EXIT -> "offline_auto_exit"
-                else -> "offline_exit"
-            }
-        )
+        ModuleStatusReporter.requestUpdate("offline_exit")
     }
-
-    private const val ENABLE_OFFLINE_AUTO_EXIT = false
 
     @JvmStatic
-    fun shouldBlockRpc(): Boolean {
-        if (!offline) return false
+    fun shouldBlockRpc(): Boolean = offline
 
-        if (!ENABLE_OFFLINE_AUTO_EXIT) {
-            return true
-        }
-
-        val untilMs = offlineUntilMs
-        if (untilMs <= 0L) return true
-
-        val now = nowProvider()
-        if (now < untilMs) return true
-
-        exitOfflineInternal(OfflineEventType.AUTO_EXIT)
-        return false
-    }
-
-    enum class TriggerPriority(val weight: Int) {
+    enum class TriggerPriority(
+        val weight: Int,
+    ) {
         HIGH(2),
         NORMAL(1),
-        LOW(0)
+        LOW(0),
     }
 
     enum class TriggerType {
@@ -370,7 +354,7 @@ object ApplicationHookConstants {
         ALARM_WAKEUP,
         BROADCAST_EXECUTE,
         BROADCAST_PREWAKEUP,
-        INTERVAL_RETRY
+        INTERVAL_RETRY,
     }
 
     data class TriggerInfo(
@@ -384,7 +368,7 @@ object ApplicationHookConstants {
         val dedupeKey: String? = null,
         val persistentScheduleId: String? = null,
         val ownerUserId: String? = null,
-        val sessionEpoch: Long = 0L
+        val sessionEpoch: Long = 0L,
     ) {
         fun summary(): String {
             val parts = mutableListOf<String>()
@@ -394,6 +378,7 @@ object ApplicationHookConstants {
             if (wakenAtTime) parts.add("wakenAtTime")
             if (!wakenTime.isNullOrBlank()) parts.add("wakenTime=$wakenTime")
             if (!reason.isNullOrBlank()) parts.add("reason=$reason")
+            if (!persistentScheduleId.isNullOrBlank()) parts.add("schedule=$persistentScheduleId")
             if (!ownerUserId.isNullOrBlank()) parts.add("owner=$ownerUserId")
             if (sessionEpoch > 0L) parts.add("session=$sessionEpoch")
             return parts.joinToString(" ")
@@ -409,44 +394,63 @@ object ApplicationHookConstants {
     var lastConsumedTrigger: TriggerInfo? = null
         private set
 
-    fun hasPendingTriggers(): Boolean = synchronized(triggerLock) {
-        pendingTrigger != null || triggerQueue.isNotEmpty()
-    }
-
-    fun pendingTriggerCount(): Int = synchronized(triggerLock) {
-        (if (pendingTrigger == null) 0 else 1) + triggerQueue.size
-    }
-
-    fun setPendingTrigger(trigger: TriggerInfo) {
+    fun hasPendingTriggers(): Boolean =
         synchronized(triggerLock) {
+            pendingTrigger != null || triggerQueue.isNotEmpty()
+        }
+
+    fun pendingTriggerCount(): Int =
+        synchronized(triggerLock) {
+            (if (pendingTrigger == null) 0 else 1) + triggerQueue.size
+        }
+
+    data class TriggerQueueResult(
+        val accepted: Boolean,
+        val displaced: TriggerInfo? = null,
+        val replaced: List<TriggerInfo> = emptyList(),
+    )
+
+    fun setPendingTrigger(trigger: TriggerInfo): TriggerQueueResult =
+        synchronized(triggerLock) {
+            val replaced = mutableListOf<TriggerInfo>()
             val dedupeKey = trigger.dedupeKey
             if (!dedupeKey.isNullOrBlank()) {
-                if (pendingTrigger?.dedupeKey == dedupeKey) {
+                pendingTrigger?.takeIf { it.dedupeKey == dedupeKey }?.let {
+                    replaced.add(it)
                     pendingTrigger = null
                 }
                 if (triggerQueue.isNotEmpty()) {
                     val it = triggerQueue.iterator()
                     while (it.hasNext()) {
-                        if (it.next().dedupeKey == dedupeKey) {
+                        val queued = it.next()
+                        if (queued.dedupeKey == dedupeKey) {
+                            replaced.add(queued)
                             it.remove()
                         }
                     }
                 }
             }
 
-            val currentPending = pendingTrigger
-            if (currentPending == null) {
-                pendingTrigger = trigger
-            } else if (trigger.priority.weight > currentPending.priority.weight) {
-                enqueueLocked(currentPending)
-                pendingTrigger = trigger
-            } else {
-                enqueueLocked(trigger)
-            }
+            val displaced =
+                when (val currentPending = pendingTrigger) {
+                    null -> {
+                        pendingTrigger = trigger
+                        null
+                    }
+
+                    else -> {
+                        if (trigger.priority.weight > currentPending.priority.weight) {
+                            pendingTrigger = trigger
+                            enqueueLocked(currentPending)
+                        } else {
+                            enqueueLocked(trigger)
+                        }
+                    }
+                }
 
             record(TAG, "📥 trigger queued: ${trigger.summary()} | pending=${pendingTrigger?.summary()} | q=${triggerQueue.size}")
+            TriggerQueueResult(accepted = true, displaced = displaced, replaced = replaced)
         }
-    }
 
     fun consumePendingTrigger(): TriggerInfo? {
         synchronized(triggerLock) {
@@ -468,8 +472,11 @@ object ApplicationHookConstants {
         }
     }
 
-    fun removePendingTriggers(reason: String, predicate: (TriggerInfo) -> Boolean): List<TriggerInfo> {
-        return synchronized(triggerLock) {
+    fun removePendingTriggers(
+        reason: String,
+        predicate: (TriggerInfo) -> Boolean,
+    ): List<TriggerInfo> =
+        synchronized(triggerLock) {
             val removed = mutableListOf<TriggerInfo>()
             val currentPending = pendingTrigger
             if (currentPending != null && predicate(currentPending)) {
@@ -491,16 +498,21 @@ object ApplicationHookConstants {
             }
             removed
         }
-    }
 
-    private fun enqueueLocked(trigger: TriggerInfo) {
+    private fun enqueueLocked(trigger: TriggerInfo): TriggerInfo? {
+        var displaced: TriggerInfo? = null
         if (triggerQueue.size >= MAX_TRIGGER_QUEUE_SIZE) {
-            val dropped = triggerQueue.pollFirst()
-            if (dropped != null) {
-                record(TAG, "🗑️ trigger queue full, drop oldest: ${dropped.summary()}")
+            // 轮询是可合并的最低优先级输入；先为唤醒和持久子任务腾出空间。
+            displaced = triggerQueue.firstOrNull {
+                it.type == TriggerType.ALARM_POLL && it.priority == TriggerPriority.LOW
+            } ?: triggerQueue.firstOrNull()
+            displaced?.let { triggerQueue.remove(it) }
+            if (displaced != null) {
+                record(TAG, "🗑️ trigger queue full, defer displaced: ${displaced.summary()}")
             }
         }
         triggerQueue.addLast(trigger)
+        return displaced
     }
 
     private fun dequeueHighestPriorityLocked(): TriggerInfo? {
@@ -526,25 +538,29 @@ object ApplicationHookConstants {
 
     private val debouncedJobs = ConcurrentHashMap<String, Job>()
 
-    fun submitEntry(name: String, block: () -> Unit): Job {
-        return GlobalThreadPools.execute(entryDispatcher + CoroutineName("Entry:$name")) { block() }
-    }
+    fun submitEntry(
+        name: String,
+        block: () -> Unit,
+    ): Job =
+        GlobalThreadPools.execute(entryDispatcher + CoroutineName("Entry:$name")) {
+            block()
+        }
 
     fun submitEntryDebounced(
         name: String,
         debounceMs: Long = DEFAULT_ENTRY_DEBOUNCE_MS,
-        block: () -> Unit
+        block: () -> Unit,
     ): Job {
         debouncedJobs.remove(name)?.cancel()
 
-        val job = GlobalThreadPools.execute(entryDispatcher + CoroutineName("Entry:$name")) {
-            if (debounceMs > 0) delay(debounceMs)
-            block()
-        }
+        val job =
+            GlobalThreadPools.execute(entryDispatcher + CoroutineName("Entry:$name")) {
+                if (debounceMs > 0) delay(debounceMs)
+                block()
+            }
 
         debouncedJobs[name] = job
         job.invokeOnCompletion { debouncedJobs.remove(name, job) }
         return job
     }
 }
-

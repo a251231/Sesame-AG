@@ -18,10 +18,7 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * @author: ghostxx
- * @date: 2025/9/17
- * @description: 全局协程调度器，用于统一管理应用内的协程，提供结构化并发和生命周期管理。
- * @update: 修复了 R8 编译器在处理 Java 兼容方法时的元数据崩溃问题
+ * 全局协程调度器，用于统一管理应用内的协程，提供结构化并发和生命周期管理。
  */
 object GlobalThreadPools {
     private const val TAG = "GlobalThreadPools"
@@ -97,9 +94,11 @@ object GlobalThreadPools {
         context: CoroutineContext = computeDispatcher,
         block: suspend CoroutineScope.() -> T
     ): Deferred<T> {
-        return globalScope.async(context) {
+        val deferred = globalScope.async(context) {
             block()
         }
+        observeUnhandledCompletion(deferred)
+        return deferred
     }
 
     /**
@@ -132,8 +131,19 @@ object GlobalThreadPools {
      */
     @JvmOverloads
     fun submit(task: Runnable?, context: CoroutineContext = computeDispatcher): Deferred<Unit> {
-        return globalScope.async(context) {
+        val deferred = globalScope.async(context) {
             task?.run()
+            Unit
+        }
+        observeUnhandledCompletion(deferred)
+        return deferred
+    }
+
+    private fun observeUnhandledCompletion(job: Job) {
+        job.invokeOnCompletion { cause ->
+            if (cause != null && cause !is CancellationException) {
+                Log.error(TAG, "提交任务执行异常: ${cause.javaClass.simpleName}")
+            }
         }
     }
 
